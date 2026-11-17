@@ -1,243 +1,137 @@
-conversation_history = []
+"""Backward-compatible brain facade.
 
-from duckduckgo_search import DDGS
-
-import ollama
-
-SYSTEM_PROMPT = """
-You are Harry, a friendly and intelligent personal AI assistant.
-You speak in a calm, polite and slightly humorous tone.
-You help the user with tasks, information and coding.
-Keep answers short and natural like a human assistant.
+The original harry.py (and the legacy tools) import functions from
+harry_brain. They are preserved here, now backed by the new modular core:
+same names, better implementation. New code should import harry_core instead.
 """
+
+import json
+import os
+
+from harry_core import llm
+from harry_core.memory import get_memory
+
+MEMORY_FILE = "memory.json"   # legacy location, kept in sync for old tools
 
 
 def ask_harry(question):
-
-    history = load_conversation()
-
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-
-    # 🔥 memory search
-    memory = search_memory(question)
-
-    if memory:
-        messages.append({"role": "system", "content": f"Past memory: {memory}"})
-        
-    # recent conversation
-    for item in history[-20:]:
-        messages.append({"role": item["role"], "content": item["text"]})
-        
-    # current question   
-    messages.append({"role": "user", "content": question})  
-    
-    # 🔥 NOW call AI
-    response = ollama.chat(
-        model="llama3",
-        messages=messages    )   
-    
-    reply = response["message"]["content"]   
-    
-    save_conversation("user", question)  
-    save_conversation("assistant", reply)  
-    
-    return reply
+    """Answer a question through the modular brain (replaces old Ollama call)."""
+    try:
+        from harry_core.task_engine import get_engine
+        task = get_engine().create_task(question)
+        result = get_engine().run_task(task["id"])
+        return result.get("answer") or result.get("result") or ""
+    except Exception as e:
+        return f"I had trouble answering that: {e}"
 
 
 def detect_intent(command):
-
-    prompt = f"""
-    Classify the user command.
-
-    Possible intents:
-    open_app
-    play_music
-    tell_time
-    general_question
-
-    Command: {command}
-
-    Respond with only the intent name.
-    """
-
-    response = ollama.chat(
-        model="llama3", messages=[{"role": "user", "content": prompt}]
+    """Legacy intent names kept for compatibility, via the router's fast model."""
+    prompt = (
+        "Classify the user command. Possible intents: open_app, play_music, "
+        "tell_time, general_question, search_web, remember.\n"
+        f"Command: {command}\nRespond with only the intent name."
     )
-
-    return response["message"]["content"].strip()
-
-
-import json
-
-MEMORY_FILE = "memory.json"
+    try:
+        return llm.chat([{"role": "user", "content": prompt}],
+                        task_class=llm.ROUTING,
+                        options={"num_predict": 10}).strip().lower()
+    except Exception:
+        return "general_question"
 
 
 def save_memory(key, value):
+    """Legacy key/value memory API, now stored in the layered memory."""
+    get_memory().store(f"{key} is {value}", kind="fact", source="legacy",
+                       importance=2)
+    _sync_legacy_file()
 
+
+def get_memory_value(key):
+    hits = get_memory().search(key, limit=1)
+    if hits:
+        text = hits[0]["text"]
+        return text.split(" is ", 1)[-1] if " is " in text else text
     try:
-        with open(MEMORY_FILE, "r") as f:
-            memory = json.load(f)
-    except:
-        memory = {}
-
-    memory[key] = value
-
-    with open(MEMORY_FILE, "w") as f:
-        json.dump(memory, f)
-
-
-def get_memory(key):
-
-    try:
-        with open(MEMORY_FILE, "r") as f:
-            memory = json.load(f)
-
-        return memory.get(key, None)
-
-    except:
+        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f).get(key)
+    except Exception:
         return None
 
 
+# old callers used the name get_memory for the key lookup
+get_memory_key = get_memory_value
+
+
 def search_web(query):
-
-    results = []
-
-    with DDGS() as ddgs:
-        for r in ddgs.text(query, max_results=3):
-            results.append(r["body"])
-
-    return " ".join(results)
+    from harry_core.builtin_tools import web_search
+    result = web_search({"query": query, "limit": 3})
+    if result.get("ok"):
+        return " ".join(r["snippet"] for r in result["results"])
+    return ""
 
 
 def plan_task(command):
-    import ollama
-
-    prompt = f"""    
-    Break this task into simple steps.    
-    
-    Task: {command}    
-    Rules:    
-    - Each step in one line    
-    - Use simple commands like: open chrome, search python, open vs code    """
-
-    response = ollama.chat(
-        model="llama3", messages=[{"role": "user", "content": prompt}]
-    )
-    steps = response["message"]["content"].split("\n")
-
-    return steps
+    """Legacy planner kept for the old 'help me' flow."""
+    from harry_core.task_engine import get_engine
+    task = get_engine().create_task(command)
+    return [s["description"] for s in get_engine().make_plan(task)]
 
 
 def create_tool(task):
-    import ollama
-    import os
-
-    prompt = f"""    
-    Create a Python tool for this task:    
-    
-    {task}    
-    
-    Rules:    
-    - Must have function: run(command, talk)    
-    - Return True if command handled    
-    - Safe code only    
-    - No explanation, only code    
-    """
-
-    response = ollama.chat(
-        model="llama3", messages=[{"role": "user", "content": prompt}]
-    )
-    code = response["message"]["content"]
-
-    filename = task.replace(" ", "_") + ".py"
-
-    path = os.path.join("tools", filename)
-
+    """Tool auto-creation, hardened: only writes into tools/ and validates."""
+    import re as _re
+    prompt = f"""Create a Python tool module for this task.
+Rules: define run(command, talk) -> bool (True if handled). Safe code only,
+no network deletes, no os.system with user input, no explanation - only code.
+Task: {task}"""
+    try:
+        code = llm.chat([{"role": "user", "content": prompt}],
+                        task_class=llm.CODING, options={"num_predict": 500})
+    except Exception as e:
+        return f"Could not create tool: {e}"
+    name = _re.sub(r"[^a-z0-9_]+", "_", task.lower().strip()[:30]) or "custom"
+    path = os.path.join("tools", f"{name}.py")
     with open(path, "w", encoding="utf-8") as f:
         f.write(code)
+    return f"Tool created: tools/{name}.py"
 
-        return f"Tool created: {filename}"
-
-import json
-
-# 🔹 LOAD CONVERSATION
-def load_conversation():
-    try:
-        with open("conversation_memory.json", "r") as f:
-            return json.load(f)
-    except:
-        return []
-
-# 🔹 SAVE CONVERSATION
-def save_conversation(role, text):
-
-    try:
-        with open("conversation_memory.json", "r") as f:
-            data = json.load(f)
-    except:
-        data = []
-
-    data.append({"role": role, "text": text})
-
-    with open("conversation_memory.json", "w") as f:
-        json.dump(data, f, indent=2)
-
-# 🔹 SEARCH MEMORY
-def search_memory(query):
-
-    try:
-        with open("conversation_memory.json", "r") as f:
-            data = json.load(f)
-    except:
-        return ""
-
-    results = []
-
-    for item in data:
-        if query.lower() in item["text"].lower():
-            results.append(item["text"])
-
-    return " ".join(results[-5:])
 
 def analyze_usage():
-
     try:
-        with open("command_history.json", "r") as f:
-            commands = json.load(f)
-    except:
+        with open(os.path.join("data", "conversation.jsonl"), "r", encoding="utf-8") as f:
+            commands = [json.loads(l).get("text", "") for l in f if l.strip()]
+    except Exception:
         return "No data to analyze"
-
-    # simple frequency check
     freq = {}
-
     for cmd in commands:
-        word = cmd.split()[0]
-
+        word = cmd.split()[0] if cmd.split() else ""
         freq[word] = freq.get(word, 0) + 1
-
-    # find most used
-    sorted_cmds = sorted(freq.items(), key=lambda x: x[1], reverse=True)
-
-    top = sorted_cmds[:3]
-
+    top = sorted(freq.items(), key=lambda x: -x[1])[:3]
     return f"Most used commands: {top}"
 
+
 def suggest_upgrade():
+    try:
+        usage = analyze_usage()
+        return llm.chat(
+            [{"role": "user", "content":
+                f"Based on this usage: {usage}\nSuggest 2-3 short feature ideas."}],
+            task_class=llm.REASONING, options={"num_predict": 120})
+    except Exception as e:
+        return f"Upgrade analysis unavailable: {e}"
 
-    usage = analyze_usage()
 
-    prompt = f"""
-    Based on this usage:
-
-    {usage}
-
-    Suggest new features or tools to improve the assistant.
-    Keep it short.
-    """
-
-    response = ollama.chat(
-        model="llama3",
-        messages=[{"role": "user", "content": prompt}]
-    )
-
-    return response["message"]["content"]
+def _sync_legacy_file():
+    """Mirror key/value memories into legacy memory.json for old tools."""
+    try:
+        items = get_memory().longterm.all()
+        data = {}
+        for i in items:
+            if " is " in i["text"]:
+                k, v = i["text"].split(" is ", 1)
+                data[k.strip()[:60]] = v.strip()[:200]
+        with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass

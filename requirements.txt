@@ -1,0 +1,40 @@
+# Harry - Python dependencies
+# Core
+requests>=2.31
+beautifulsoup4>=4.12
+psutil>=5.9
+Flask>=3.0
+
+# Voice (offline)
+vosk>=0.3.45
+sounddevice>=0.4.6
+pyttsx3>=2.90
+numpy>=1.26
+
+# Wake word (optional, needs free Picovoice access key)
+pvporcupine>=4.0
+
+# Voice authentication (optional)
+Resemblyzer>=0.1.3
+torch>=2.0
+
+# Web search / research
+duckduckgo-search>=6.0
+wikipedia>=1.4
+
+# Computer control / vision
+PyAutoGUI>=0.9.54
+pyperclip>=1.8
+pytesseract>=0.3.10
+Pillow>=10.0
+mss>=9.0
+
+# LLM
+ollama>=0.4
+
+# Mathematics / engineering computation (Phase 8)
+sympy>=1.12
+
+# Local document intelligence (optional extras)
+# pypdf>=4.0          # .pdf reading in read_document
+# pytesseract>=0.3.10 # OCR fallback for understand_screen (also needs the Tesseract binary)

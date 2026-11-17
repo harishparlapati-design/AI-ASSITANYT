@@ -1,0 +1,42 @@
+{
+  "assistant_name": "Harry",
+  "user_name": "",
+  "wake_word": "harry",
+  "log_level": "INFO",
+  "models": {
+    "provider": "auto",
+    "local": {
+      "type": "ollama",
+      "url": "http://localhost:11434",
+      "chat_model": "llama3.1:latest",
+      "reasoning_model": "qwen3:4b",
+      "routing_model": "llama3.1:latest"
+    },
+    "online": {
+      "type": "none",
+      "url": "",
+      "api_key_env": "",
+      "model": ""
+    },
+    "vision_model": ""
+  },
+  "voice": {
+    "enabled": true,
+    "wake_word_mode": "text",
+    "porcupine_access_key_env": "PORCUPINE_ACCESS_KEY",
+    "keyword_path": "hay-harry_en_windows_v4_0_0.ppn",
+    "stt_model": "vosk-model-en-us-0.22",
+    "tts_rate": 175,
+    "output_mode": "both",
+    "verify_voice": false,
+    "voice_profile_path": "hareesh_voice_profile.pkl"
+  },
+  "security": {
+    "require_confirmation_for": "sensitive",
+    "allowed_dirs": []
+  },
+  "proactive": {
+    "enabled": true,
+    "briefing_hour": 8
+  }
+}

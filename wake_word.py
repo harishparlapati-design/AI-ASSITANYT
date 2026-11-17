@@ -1,40 +1,13 @@
-import pvporcupine
-import pyaudio
-import struct
-import os
+"""Backward-compatible wake word module.
 
-def wait_for_wake_word():
+The old harry.py imports wait_for_wake_word from here. Real wake-word
+handling now lives in harry_core.speech (Porcupine keyword file support,
+STT-based fallback, or always-on for UI mode).
+"""
 
-    access_key = os.getenv("PICO_VOICE_ACCESS_KEY")
-    if not access_key:
-        raise RuntimeError(
-            "Missing PICO_VOICE_ACCESS_KEY environment variable for Porcupine wake word."
-        )
+from harry_core.speech import wait_for_wake_word  # noqa: F401
 
-    porcupine = pvporcupine.create(
-        access_key=access_key,
-        
-        keyword_paths=["hay-harry_en_windows_v4_0_0.ppn"]
-    )
-    pa = pyaudio.PyAudio()
-
-    audio_stream = pa.open(
-        rate=porcupine.sample_rate,
-        channels=1,
-        format=pyaudio.paInt16,
-        input=True,
-        frames_per_buffer=porcupine.frame_length
-    )
-
-    print("Waiting for wake word...")
-
-    while True:
-
-        pcm = audio_stream.read(porcupine.frame_length)
-        pcm = struct.unpack_from("h" * porcupine.frame_length, pcm)
-
-        result = porcupine.process(pcm)
-
-        if result >= 0:
-            print("Wake word detected!")
-            return True
+if __name__ == "__main__":
+    print("Say the wake word...")
+    if wait_for_wake_word():
+        print("Wake word detected!")

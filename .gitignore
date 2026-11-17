@@ -1,5 +1,42 @@
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
+
+# Virtual environments (never commit installed packages)
 .venv/
+venv/
+
+# Logs and temporary files
 *.log
 *.tmp
+logs/
+logs_*.txt
+
+# Personal runtime data (memory, conversations, tasks)
+data/
+memory.json
+conversation_memory.json
+downloads/
+
+# Local configuration and secrets
+config.json
+.env
+.env.*
+
+# Personal voice data / trained models
+*.pkl
+voice_samples/
+vosk-model-*/
+hay_harry_window/
+
+# Tooling
+.freebuff/
+.vscode/
+
+# Build output (the PyInstaller spec is source, not output)
+build/*
+!build/harry.spec
+dist/
+harry_build_info.py
