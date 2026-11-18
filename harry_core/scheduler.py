@@ -28,7 +28,7 @@ class Scheduler:
         self._lock = threading.Lock()
         self._thread = None
         self._last_brief_day = None
-        self._briefed_today = False
+        self._last_nudge = 0.0
 
     # -- reminders ----------------------------------------------------------
 
@@ -93,7 +93,7 @@ class Scheduler:
             self._daily_briefing()
 
         # unfinished-task nudge (at most every 2 hours, quiet hours respected)
-        if 9 <= local_hour <= 21 and now - getattr(self, "_last_nudge", 0) > 2 * 3600:
+        if 9 <= local_hour <= 21 and now - self._last_nudge > 2 * 3600:
             self._nudge_unfinished()
 
     def _daily_briefing(self):

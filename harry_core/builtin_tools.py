@@ -7,7 +7,7 @@ Danger levels:
   sensitive  - delete/send/upload/shutdown
 """
 
-import json
+import logging
 import os
 import platform
 import re
@@ -17,11 +17,13 @@ import sys
 import time
 import webbrowser
 
-from . import config, events, llm, runtime_paths
+from . import config, llm, runtime_paths
 from .memory import get_memory
 from .security import SAFE, CONTROLLED, SENSITIVE
 
 IS_WINDOWS = platform.system() == "Windows"
+
+log = logging.getLogger("harry.tools.builtin")
 
 
 def _root(p):
@@ -383,6 +385,9 @@ def computer_control(args):
     action = str(args.get("action", ""))
     try:
         import pyautogui
+    except Exception as e:
+        return {"ok": False, "error": f"computer control unavailable: {e}"}
+    try:
         pyautogui.FAILSAFE = True  # slam mouse to corner = abort
         if action == "click":
             pyautogui.click(int(args.get("x", 0)), int(args.get("y", 0)))
@@ -401,9 +406,10 @@ def computer_control(args):
         else:
             return {"ok": False, "error": f"unknown action: {action}"}
         return {"ok": True, "action": action}
-    except pyautogui.FailSafeException:  # noqa
-        return {"ok": False, "error": "failsafe triggered - emergency stop"}
     except Exception as e:
+        # Matched by name so this handler still works if pyautogui is absent.
+        if type(e).__name__ == "FailSafeException":
+            return {"ok": False, "error": "failsafe triggered - emergency stop"}
         return {"ok": False, "error": str(e)}
 
 
@@ -469,7 +475,7 @@ def vision_analyze(args):
             answer = llm.chat(messages, task_class=llm.VISION)
             return {"ok": True, "analysis": answer, "model": vision_model}
         except Exception as e:
-            log_error = e
+            log.warning("vision model failed (%s); trying OCR", e)
     # fallback: OCR via pytesseract if present
     try:
         import pytesseract

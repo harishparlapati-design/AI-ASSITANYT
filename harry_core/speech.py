@@ -17,15 +17,13 @@ import difflib
 import json
 import logging
 import os
-import platform
 import re
 import threading
+import time
 
 from . import config, events, runtime_paths
 
 log = logging.getLogger("harry.speech")
-
-IS_WINDOWS = platform.system() == "Windows"
 
 # --------------------------------------------------------------------- language detection
 
@@ -149,8 +147,6 @@ class Speaker:
         mode = output_mode or config.CONFIG.get("voice", {}).get("output_mode", "both")
         if mode == "text" or not self.enabled:
             return
-        if not IS_WINDOWS and not self._engine:
-            pass  # still try; pyttsx3 works on other OSes too via espeak
         eng = self._init_engine()
         if not eng:
             return
@@ -251,11 +247,11 @@ class Listener:
                     else:
                         if not speech_started:
                             speech_started = True
-                            started_at = __import__("time").time()
+                            started_at = time.time()
                         silence = 0
                     if speech_started:
                         rec.AcceptWaveform(data)
-                        if started_at and __import__("time").time() - started_at > max_seconds:
+                        if started_at and time.time() - started_at > max_seconds:
                             break
             result = json.loads(rec.FinalResult())
             text = (result.get("text") or "").strip()

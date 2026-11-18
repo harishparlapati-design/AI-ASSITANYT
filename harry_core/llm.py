@@ -19,10 +19,10 @@ gracefully (e.g. planner falls back to rule-based planning).
 
 import json
 import logging
+import os
 import re
 import time
 import urllib.request
-import urllib.error
 
 from . import config
 
@@ -122,17 +122,11 @@ class OpenAICompatibleProvider:
         self.cfg = cfg
         self.url = (cfg.get("url") or "").rstrip("/")
         self.model = cfg.get("model") or ""
-        self.api_key = ""
-        env_name = cfg.get("api_key_env") or ""
-        if env_name:
-            import os
-            self.api_key = os.environ.get(env_name, "")
 
     def available(self):
         return bool(self.cfg.get("type") == "openai_compatible" and self.url and self.model)
 
     def chat(self, model, messages, options=None, json_mode=False):
-        import os
         if not self.available():
             raise ProviderError("online provider not configured")
         headers = {"Content-Type": "application/json"}

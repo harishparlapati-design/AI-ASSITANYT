@@ -13,6 +13,7 @@ All real logic lives in the harry_core package.
 import argparse
 import sys
 import threading
+import time
 
 from harry_core import logging_setup, runtime_paths
 from harry_core.brain import get_brain
@@ -61,15 +62,15 @@ def voice_loop(brain):
             continue
         brain.say(f"Hello{', ' + CONFIG['user_name'] if CONFIG['user_name'] else ''}, "
                   "I am listening. Say 'stop listening' to go back to sleep.")
-        last_active = __import__("time").time()
+        last_active = time.time()
         while not is_stopped():
             heard = listener.listen_once(max_seconds=15)
             if not heard:
-                if __import__("time").time() - last_active > 90:
+                if time.time() - last_active > 90:
                     brain.say("Going back to sleep. Say the wake word when you need me.")
                     break
                 continue
-            last_active = __import__("time").time()
+            last_active = time.time()
             low = heard.lower()
             if "stop listening" in low or "goodbye" in low or "go to sleep" in low:
                 brain.say("Okay, going back to sleep.")
@@ -108,7 +109,7 @@ def main():
         threading.Thread(target=voice_loop, args=(brain,), daemon=True).start()
         try:
             while True:
-                __import__("time").sleep(1)
+                time.sleep(1)
         except KeyboardInterrupt:
             pass
     elif args.ui:

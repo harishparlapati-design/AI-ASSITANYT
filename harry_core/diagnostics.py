@@ -35,8 +35,9 @@ def run_diagnostics():
         models = router.local_models()
         checks.append(_check("local AI (Ollama)", bool(models),
                              f"models: {', '.join(models[:5]) or 'none'}"))
-        checks.append(_check("online AI provider", router.online_available(),
-                             "configured" if router.online_available() else "not configured (optional)"))
+        online = router.online_available()
+        checks.append(_check("online AI provider", online,
+                             "configured" if online else "not configured (optional)"))
     except Exception as e:
         checks.append(_check("local AI (Ollama)", False, e))
 
@@ -95,7 +96,7 @@ def run_diagnostics():
         try:
             importlib.import_module(mod)
             checks.append(_check(f"dep: {label}", True))
-        except Exception as e:
+        except Exception:
             checks.append(_check(f"dep: {label}", False, "missing"))
 
     # report (ASCII-safe for Windows consoles)
