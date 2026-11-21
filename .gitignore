@@ -25,9 +25,10 @@ config.json
 .env
 .env.*
 
-# Personal voice data / trained models
+# Personal voice data / trained models (kept local only, never committed)
 *.pkl
 voice_samples/
+vosk-model-en-us-0.22/
 vosk-model-*/
 hay_harry_window/
 
