@@ -1,2 +1,5 @@
-venv/** filter=lfs diff=lfs merge=lfs -text
-.venv/** filter=lfs diff=lfs merge=lfs -text
+# Git LFS is no longer used by this repository.
+#
+# The only files that were ever stored in LFS were the committed virtual
+# environments (venv/** and .venv/**). They are untracked, ignored, and removed
+# from dev's history, so no LFS filter rules remain.

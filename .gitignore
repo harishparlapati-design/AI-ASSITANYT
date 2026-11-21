@@ -27,6 +27,7 @@ config.json
 
 # Personal voice data / trained models (kept local only, never committed)
 *.pkl
+hareesh_voice_profile.pkl
 voice_samples/
 vosk-model-en-us-0.22/
 vosk-model-*/
