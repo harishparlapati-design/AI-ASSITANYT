@@ -358,6 +358,32 @@ def create_app():
             return jsonify({"ok": True, "mode": mode})
         return jsonify({"error": "invalid"}), 400
 
+    # ---------------- voice settings ----------------
+
+    @app.get("/api/voice")
+    def get_voice():
+        from .speech import get_speaker
+        return jsonify(get_speaker().voice_state())
+
+    @app.post("/api/voice")
+    def set_voice():
+        from .speech import get_speaker
+        payload = request.get_json(silent=True) or {}
+        speaker = get_speaker()
+        ok = speaker.update_settings(name=payload.get("name"),
+                                     gender=payload.get("gender"),
+                                     rate=payload.get("rate"),
+                                     volume=payload.get("volume"))
+        if not ok:
+            return jsonify({"error": "nothing to change", **speaker.voice_state()}), 400
+        return jsonify({"ok": True, **speaker.voice_state()})
+
+    @app.post("/api/speech/stop")
+    def stop_speaking():
+        from .speech import get_speaker
+        get_speaker().stop_speaking()
+        return jsonify({"ok": True})
+
     events.subscribe(_q_listener)
     _flask = app
     return app
@@ -428,6 +454,16 @@ _INDEX_HTML = """<!doctype html>
     <label><input type="radio" name="om" value="both"> text+voice</label><br>
     <label><input type="radio" name="om" value="text"> text only</label><br>
     <label><input type="radio" name="om" value="voice"> voice only</label>
+  </div>
+  <h2>Voice</h2>
+  <div class="card">
+    <select id="voiceSel" style="width:100%;background:#0f1420;color:var(--tx);border:1px solid #232c40;border-radius:6px;padding:6px"></select>
+    <div id="voiceMeta" style="font-size:11px;color:var(--dim);margin:6px 0">-</div>
+    <label style="display:block;font-size:12px">speed <span id="rateVal">170</span>
+      <input id="rate" type="range" min="120" max="240" step="5" style="width:100%"></label>
+    <label style="display:block;font-size:12px">volume <span id="volVal">100</span>%
+      <input id="vol" type="range" min="0" max="100" step="5" style="width:100%"></label>
+    <button id="speakStop" class="ghost" style="width:100%;margin-top:6px">⏹ Stop speaking</button>
   </div>
 </aside>
 <main>
@@ -927,6 +963,68 @@ document.querySelectorAll('input[name=om]').forEach(function(r){
     sys('output: ' + r.value);
   });
 });
+
+/* ---------------- voice settings ---------------- */
+
+const voiceSel = document.getElementById('voiceSel');
+const voiceMeta = document.getElementById('voiceMeta');
+const rateInput = document.getElementById('rate');
+const volInput = document.getElementById('vol');
+
+function renderVoice(v){
+  voiceSel.innerHTML = '';
+  (v.voices || []).forEach(function(item){
+    const o = document.createElement('option');
+    o.value = item.name;
+    o.textContent = item.name + (item.gender ? ' · ' + item.gender : '');
+    o.selected = !!item.current;
+    voiceSel.appendChild(o);
+  });
+  if (!(v.voices || []).length){
+    const o = document.createElement('option');
+    o.textContent = 'no installed voices found';
+    voiceSel.appendChild(o);
+  }
+  voiceMeta.textContent = v.current
+    ? ('speaking as: ' + v.current + ' (' + (v.current_gender || 'unknown') + ')')
+    : 'engine default voice';
+  rateInput.value = v.rate;
+  volInput.value = Math.round((v.volume || 0) * 100);
+  document.getElementById('rateVal').textContent = v.rate;
+  document.getElementById('volVal').textContent = Math.round((v.volume || 0) * 100);
+}
+
+async function loadVoice(){
+  try { renderVoice(await (await fetch('/api/voice')).json()); } catch (_) {}
+}
+
+async function saveVoice(body){
+  try {
+    const res = await fetch('/api/voice', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    if (res.ok) renderVoice(await res.json());
+    else sys('⚠ that voice setting was not accepted');
+  } catch (e) { sys('⚠ ' + humanError(e)); }
+}
+
+voiceSel.addEventListener('change', function(){ saveVoice({ name: voiceSel.value }); });
+rateInput.addEventListener('change', function(){
+  document.getElementById('rateVal').textContent = rateInput.value;
+  saveVoice({ rate: Number(rateInput.value) });
+});
+volInput.addEventListener('change', function(){
+  document.getElementById('volVal').textContent = volInput.value;
+  saveVoice({ volume: Number(volInput.value) / 100 });
+});
+document.getElementById('speakStop').addEventListener('click', function(){
+  fetch('/api/speech/stop', { method: 'POST' });
+  sys('speech stopped');
+});
+
+loadVoice();
 
 addMsg('sys', 'Harry ready. Type, or press 🎤 to talk. Voice and text share this conversation.');
 refreshState();

@@ -63,7 +63,16 @@ DEFAULTS = {
         "keyword_path": "hay-harry_en_windows_v4_0_0.ppn",
         "stt_model": "vosk-model-en-us-0.22",
         "tts_engine": "pyttsx3",
-        "tts_rate": 175,
+        # Voice selection is metadata-driven: the requested gender is matched
+        # against the installed voice's Gender attribute, never its name.
+        "voice_gender": "male",            # male | female | any
+        "voice_name": "",                  # pin an installed voice (substring ok)
+        "tts_rate": 170,                   # words per minute (slower = calmer)
+        "tts_volume": 1.0,
+        "tts_sentence_pause_ms": 200,      # pause between sentences
+        "tts_max_sentence_chars": 240,     # long answers are chunked for this
+        "tts_read_numbers": True,          # "2026" -> "two thousand and twenty six"
+        "tts_expand_abbreviations": True,  # "e.g." -> "for example"
         "output_mode": "both",             # text | voice | both
         "verify_voice": False,             # voiceprint check on wake
         "verify_threshold": 0.43,
@@ -87,6 +96,40 @@ def _deep_merge(base, override):
         else:
             base[k] = v
     return base
+
+
+def update_user(section, values, path=None):
+    """Persist settings into the user's config.json (never config.example.json).
+
+    Only the given keys are written; everything else in the file is preserved.
+    Returns the file path on success, else None.
+    """
+    if not isinstance(values, dict) or not values:
+        return None
+    target = path or os.path.join(runtime_paths.workspace_root(), "config.json")
+    data = {}
+    try:
+        if os.path.exists(target):
+            with open(target, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+        node = data.setdefault(section, {})
+        if not isinstance(node, dict):
+            node = data[section] = {}
+        node.update(values)
+        folder = os.path.dirname(target)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        tmp = target + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        os.replace(tmp, target)
+        return target
+    except Exception as e:
+        print(f"[config] could not save settings: {e}")
+        return None
 
 
 def load():

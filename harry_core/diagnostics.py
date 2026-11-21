@@ -48,8 +48,12 @@ def run_diagnostics():
                              get_listener().model_path))
         spk = get_speaker()
         eng = spk._init_engine()
-        checks.append(_check("TTS (pyttsx3)", bool(eng),
-                             f"voices: {', '.join(spk.available_voices()) or 'default only'}"))
+        state = spk.voice_state() if eng else {}
+        checks.append(_check(
+            "TTS (pyttsx3)", bool(eng),
+            (f"voice: {state.get('current') or 'engine default'} "
+             f"({state.get('current_gender') or 'unknown'}); "
+             f"{len(state.get('voices') or [])} installed") if eng else "unavailable"))
     except Exception as e:
         checks.append(_check("voice", False, e))
 

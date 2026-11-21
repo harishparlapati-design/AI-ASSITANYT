@@ -30,7 +30,12 @@ tool_modules = [
 ]
 
 hiddenimports = sorted(
-    {"harry_brain"}.union(tool_modules)  # harry_brain is imported by tools/research.py
+    {"harry_brain",           # harry_brain is imported by tools/research.py
+     # pyttsx3 loads its SAPI5 driver at runtime through comtypes; the frozen
+     # build must bundle the driver and the generated SpeechLib typelib or TTS
+     # dies with "no such driver" inside the EXE.
+     "pyttsx3.drivers", "pyttsx3.drivers.sapi5",
+     "comtypes.gen", "comtypes.gen.SpeechLib"}.union(tool_modules)
 )
 
 # Voices metadata the frozen app needs when the tools/ data folder is absent:
