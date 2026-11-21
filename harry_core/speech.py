@@ -456,6 +456,8 @@ class Speaker:
 
     def voice_for(self, text=""):
         """Voice that will speak this text (None = engine default)."""
+        if not self._catalog and self._engine is None and self.enabled:
+            self._init_engine()
         cfg = _voice_cfg()
         language = "english"
         if text:
