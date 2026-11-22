@@ -234,7 +234,12 @@ class TaskEngine:
         the model + tools work it out anyway.
         """
         from .agents import catalog_hint, select_agent
+        from .language_policy import instruction as language_instruction
+        from . import config
         agent = select_agent(task.title)
+        lang_rule = language_instruction(
+            task.title, config.CONFIG.get("language", {}).get("preference", "auto")
+        )
         catalog = get_registry().catalog()
         prompt = f"""You are the planner of an autonomous assistant, acting as the
 {agent.name} ({agent.description}).
@@ -250,6 +255,7 @@ Respond with JSON only:
 Rules:
 - Preserve EXACT filenames, paths and content strings from the GOAL in the steps.
 - Prefer a direct tool step (e.g. write_file) over vague "identify" steps.
+- {lang_rule}
 
 GOAL (exact user request): {task.title}
 CONTEXT: {task.description or 'none'}
@@ -416,6 +422,11 @@ Memory context: {self._memory_context(task.title)}"""
 
     def _llm_execute_step(self, task, step):
         registry = get_registry()
+        from .language_policy import instruction as language_instruction
+        from . import config
+        lang_rule = language_instruction(
+            task.title, config.CONFIG.get("language", {}).get("preference", "auto")
+        )
         prior = "\n".join(
             f"- {s['description']}: {str(s.get('result'))[:150]}"
             for s in task.steps if s.get("result")
@@ -430,6 +441,7 @@ Tools:
 
 Task: {task.title}
 Step: {step['description']}
+Language rule for user-visible answer content: {lang_rule}
 Previous step results: {prior}
 Memory: {self._memory_context(task.title + ' ' + step['description'])}"""
         raw = llm.chat([{"role": "user", "content": prompt}],
@@ -588,16 +600,19 @@ Respond JSON: {{"analysis": "...", "strategy": "retry" | "alternative",
 
     def _answer_question(self, task):
         from .agents import prompt_for, select_agent
+        from .language_policy import instruction as language_instruction
+        from . import config
         agent = select_agent(task.title)
+        lang_rule = language_instruction(
+            task.title, config.CONFIG.get("language", {}).get("preference", "auto")
+        )
         memory_hits = self._memory_context(task.title)
         convo = get_memory().conversation.recent(8)
         messages = [{
             "role": "system",
-            "content": prompt_for(agent) + (
-                " Reply in the language of the user's latest message; only mix "
-                "Telugu/Hindi with English when that message is itself mixed. When "
-                "the user gives an exact instruction (for example 'reply with "
-                "exactly: X'), comply literally. Never invent facts."
+            "content": prompt_for(agent) + " " + lang_rule + (
+                " When the user gives an exact instruction, comply literally. "
+                "Never invent facts."
             ),
         }]
         if memory_hits != "none":

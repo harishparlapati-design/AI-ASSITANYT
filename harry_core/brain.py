@@ -284,6 +284,9 @@ class Brain:
         # ---- deterministic fast paths (never touch the model) ----
         fast = self._fast_reply(text, low)
         if fast is not None:
+            from .language_policy import general_fast_reply
+            preference = config.CONFIG.get("language", {}).get("preference", "auto")
+            fast = general_fast_reply(fast, text, preference)
             log.info("[%s] fast path", rid)
             return finish(fast)
 

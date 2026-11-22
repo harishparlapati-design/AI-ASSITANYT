@@ -14,8 +14,12 @@ import copy
 import json
 import os
 import shutil
+import tempfile
+import threading
 
 from . import runtime_paths
+
+_CONFIG_WRITE_LOCK = threading.RLock()
 
 DEFAULTS = {
     "assistant_name": "Harry",
@@ -78,6 +82,21 @@ DEFAULTS = {
         "verify_threshold": 0.43,
         "voice_profile_path": "hareesh_voice_profile.pkl",
     },
+    "language": {
+        # auto follows the product policy: mixed Telugu-English for general
+        # conversation and English for task/technical responses.
+        "preference": "auto",          # auto | mixed | english | telugu
+    },
+    "appearance": {
+        "theme": "system",             # system | dark | light
+    },
+    "integrations": {
+        # These flags control whether Harry may delegate to already-installed
+        # local CLIs. They do not imply that a CLI is installed or signed in.
+        "codex_enabled": True,
+        "claude_enabled": True,
+        "github_enabled": True,
+    },
     "security": {
         "require_confirmation_for": "sensitive",   # sensitive | controlled | none
         "allowed_dirs": [],                        # empty = all, still audited
@@ -98,38 +117,63 @@ def _deep_merge(base, override):
     return base
 
 
-def update_user(section, values, path=None):
-    """Persist settings into the user's config.json (never config.example.json).
+def update_user_sections(sections, path=None):
+    """Atomically persist several settings sections in the user's config.json.
 
-    Only the given keys are written; everything else in the file is preserved.
-    Returns the file path on success, else None.
+    Existing values outside the supplied keys are preserved. Returns the file
+    path on success, else None.
     """
-    if not isinstance(values, dict) or not values:
+    if not isinstance(sections, dict) or not sections:
+        return None
+    if any(not isinstance(values, dict) or not values
+           for values in sections.values()):
         return None
     target = path or os.path.join(runtime_paths.workspace_root(), "config.json")
-    data = {}
-    try:
-        if os.path.exists(target):
-            with open(target, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        if not isinstance(data, dict):
-            data = {}
-        node = data.setdefault(section, {})
-        if not isinstance(node, dict):
-            node = data[section] = {}
-        node.update(values)
-        folder = os.path.dirname(target)
-        if folder:
-            os.makedirs(folder, exist_ok=True)
-        tmp = target + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-            f.write("\n")
-        os.replace(tmp, target)
-        return target
-    except Exception as e:
-        print(f"[config] could not save settings: {e}")
+    if any(not isinstance(section, str) or not section
+           or any(not isinstance(key, str) or not key for key in values)
+           for section, values in sections.items()):
         return None
+    folder = os.path.dirname(os.path.abspath(target))
+    tmp = None
+    try:
+        with _CONFIG_WRITE_LOCK:
+            data = {}
+            if os.path.exists(target):
+                with open(target, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            if not isinstance(data, dict):
+                return None
+            for section, values in sections.items():
+                node = data.setdefault(section, {})
+                if not isinstance(node, dict):
+                    node = data[section] = {}
+                node.update(values)
+            os.makedirs(folder, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(prefix=".harry-config-", suffix=".tmp",
+                                       dir=folder)
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, target)
+            tmp = None
+        return target
+    except Exception:
+        return None
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def update_user(section, values, path=None):
+    """Persist settings into the user's config.json (never config.example.json)."""
+    if not isinstance(values, dict) or not values:
+        return None
+    return update_user_sections({section: values}, path=path)
 
 
 def load():

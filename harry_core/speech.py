@@ -105,6 +105,17 @@ def style_reply_hint(user_text):
 
 VOICE_GENDERS = ("male", "female")
 _NATURAL_HINTS = ("natural", "neural", "online", "premium")
+# pyttsx3 maps words-per-minute onto SAPI's logarithmic -10..10 rate. Below
+# ~150 wpm the value clips at the SAPI floor and a short sentence takes a
+# minute; above ~260 it clips at the ceiling and stops getting faster.
+RATE_MIN, RATE_MAX = 150, 260
+
+
+def _clamp_rate(value, default=170):
+    try:
+        return max(RATE_MIN, min(RATE_MAX, int(value)))
+    except (TypeError, ValueError):
+        return default
 
 
 def _voice_cfg():
@@ -424,15 +435,33 @@ class Speaker:
             self.enabled = False
             return None
 
+    def _sapi_driver(self):
+        """The pyttsx3 SAPI5 driver, which applies properties immediately.
+
+        pyttsx3's public setProperty/say calls are queued and only pumped while
+        runAndWait() owns the thread, which makes them useless for stopping an
+        utterance that is already playing. The driver below talks to SAPI
+        directly and therefore works from the speaking thread.
+        """
+        try:
+            driver = getattr(getattr(self._engine, "proxy", None), "_driver", None)
+            if driver is not None and hasattr(driver, "_tts"):
+                return driver
+        except Exception:
+            pass
+        return None
+
     def _apply_engine_settings(self, engine):
         cfg = _voice_cfg()
+        driver = self._sapi_driver()
         try:
-            engine.setProperty("rate", int(cfg.get("tts_rate", 170)))
+            rate = _clamp_rate(cfg.get("tts_rate", 170))
+            (driver or engine).setProperty("rate", rate)
         except Exception as e:
             log.debug("could not set TTS rate: %s", e)
         try:
             volume = max(0.0, min(1.0, float(cfg.get("tts_volume", 1.0))))
-            engine.setProperty("volume", volume)
+            (driver or engine).setProperty("volume", volume)
         except Exception as e:
             log.debug("could not set TTS volume: %s", e)
 
@@ -483,7 +512,7 @@ class Speaker:
             "current_gender": (chosen or {}).get("gender", ""),
             "configured_gender": cfg.get("voice_gender", "male"),
             "configured_name": cfg.get("voice_name", ""),
-            "rate": int(cfg.get("tts_rate", 170)),
+            "rate": _clamp_rate(cfg.get("tts_rate", 170)),
             "volume": float(cfg.get("tts_volume", 1.0)),
             "voices": [dict(v, current=bool(chosen and v["id"] == chosen["id"]))
                        for v in self._catalog],
@@ -493,7 +522,15 @@ class Speaker:
         """Change voice/rate/volume, apply live and persist to config.json."""
         changes = {}
         if name is not None:
-            changes["voice_name"] = str(name).strip()
+            requested_name = str(name).strip()
+            if requested_name:
+                self.voice_state()
+                match = next((voice for voice in self._catalog
+                              if voice["name"] == requested_name), None)
+                if match is None:
+                    return False
+                requested_name = match["name"]
+            changes["voice_name"] = requested_name
         if gender is not None:
             value = str(gender).strip().lower()
             if value not in VOICE_GENDERS + ("any",):
@@ -501,9 +538,10 @@ class Speaker:
             changes["voice_gender"] = value
         if rate is not None:
             try:
-                changes["tts_rate"] = max(80, min(300, int(rate)))
+                value = int(rate)
             except (TypeError, ValueError):
                 return False
+            changes["tts_rate"] = max(RATE_MIN, min(RATE_MAX, value))
         if volume is not None:
             try:
                 changes["tts_volume"] = max(0.0, min(1.0, float(volume)))
@@ -511,8 +549,9 @@ class Speaker:
                 return False
         if not changes:
             return False
+        if not config.update_user("voice", changes):
+            return False
         config.CONFIG.setdefault("voice", {}).update(changes)
-        config.update_user("voice", changes)
         engine = self._engine
         if engine is not None:
             self._apply_engine_settings(engine)
@@ -520,18 +559,32 @@ class Speaker:
         return True
 
     def _apply_voice(self, engine, voice):
+        """Queue the voice change on the engine.
+
+        pyttsx3 (SAPI5) buffers property changes until the engine next runs, so
+        the value can only be verified after an utterance - see _verify_voice.
+        """
         if not voice:
             return
         try:
-            engine.setProperty("voice", voice["id"])
-            current = engine.getProperty("voice")
-            if isinstance(current, str) and current and current != voice["id"]:
-                log.warning("TTS voice did not switch (wanted %s)", voice["name"])
-                return
+            (self._sapi_driver() or engine).setProperty("voice", voice["id"])
             self._current = voice["name"]
             log.debug("speaking with %s (%s)", voice["name"], voice["gender"] or "unknown")
         except Exception as e:
             log.warning("could not select TTS voice %s: %s", voice.get("name"), e)
+
+    def _verify_voice(self, engine, voice):
+        """Confirm the engine really switched, once its queue has been driven."""
+        if not voice:
+            return True
+        try:
+            current = engine.getProperty("voice")
+        except Exception:
+            return True
+        if isinstance(current, str) and current and current != voice["id"]:
+            log.warning("TTS voice did not switch (wanted %s)", voice["name"])
+            return False
+        return True
 
     # ---------------- speaking ----------------
 
@@ -562,15 +615,30 @@ class Speaker:
             self._stop.clear()
             self._speaking.set()
             try:
-                self._apply_voice(engine, self.voice_for(text))
+                selected = self.voice_for(text)
+                self._apply_voice(engine, selected)
+                # re-apply rate/volume so dashboard changes take effect at once
+                self._apply_engine_settings(engine)
+                driver = self._sapi_driver()
+                stopped = False
                 for index, chunk in enumerate(chunks):
                     if self._stop.is_set() or events.is_stopped():
-                        log.info("speech stopped by request")
+                        stopped = True
                         break
-                    engine.say(chunk)
-                    engine.runAndWait()
-                    if pause and index < len(chunks) - 1 and not self._stop.is_set():
-                        time.sleep(pause)
+                    if driver is not None:
+                        stopped = self._speak_chunk_sapi(driver, chunk)
+                    else:
+                        engine.say(chunk)
+                        engine.runAndWait()
+                        if index == 0:
+                            self._verify_voice(engine, selected)
+                    if stopped:
+                        log.info("speech stopped mid-sentence")
+                        break
+                    if pause and index < len(chunks) - 1:
+                        deadline = time.time() + pause
+                        while time.time() < deadline and not self._stop.is_set():
+                            time.sleep(0.02)
             except Exception as e:
                 log.warning("speak failed: %s", e)
                 return False
@@ -578,15 +646,35 @@ class Speaker:
                 self._speaking.clear()
         return True
 
+    def _speak_chunk_sapi(self, driver, chunk):
+        """Speak one chunk, polling so a stop request can purge it mid-sentence.
+
+        Returns True when the chunk was interrupted.
+        """
+        tts = driver._tts
+        tts.Speak(chunk, 1)                     # SVSFlagsAsync
+        while not tts.WaitUntilDone(100):       # ms
+            if self._stop.is_set() or events.is_stopped():
+                tts.Speak("", 3)                # SVSFPurgeBeforeSpeak: abort now
+                return True
+        return False
+
     def stop_speaking(self):
         """Stop the current utterance and the remaining queued sentences."""
         self._stop.set()
         engine = self._engine
-        if engine is not None:
+        if engine is None:
+            return
+        driver = self._sapi_driver()
+        if driver is not None:
             try:
-                engine.stop()
+                driver._tts.Speak("", 3)        # purge whatever is playing right now
             except Exception as e:
-                log.debug("engine stop failed: %s", e)
+                log.debug("SAPI purge failed: %s", e)
+        try:
+            engine.stop()
+        except Exception as e:
+            log.debug("engine stop failed: %s", e)
 
     @property
     def speaking(self):

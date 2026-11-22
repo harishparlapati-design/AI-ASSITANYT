@@ -79,6 +79,51 @@ class FakeEngine:
         pass
 
 
+class FakeTts:
+    """Minimal ISpeechVoice stand-in that records speech and purges."""
+
+    def __init__(self):
+        self.said = []
+        self.purged = 0
+        self.pending = 0
+        self.hook = None
+
+    def Speak(self, text, flags):
+        if flags == 3:                 # purge
+            self.purged += 1
+            self.pending = 0
+        else:
+            self.said.append(text)
+            self.pending = 2           # two "still speaking" polls, then done
+
+    def WaitUntilDone(self, ms):
+        if self.hook:
+            self.hook()
+        if self.pending > 0:
+            self.pending -= 1
+            return False
+        return True
+
+
+class FakeSapiDriver:
+    def __init__(self):
+        self._tts = FakeTts()
+        self.props = {}
+
+    def setProperty(self, name, value):
+        self.props[name] = value
+
+
+class FakeSapiEngine(FakeEngine):
+    """Engine exposing a SAPI-like driver, i.e. the immediate path."""
+
+    def __init__(self, voices):
+        super().__init__(voices)
+        self.driver = FakeSapiDriver()
+        from types import SimpleNamespace
+        self.proxy = SimpleNamespace(_driver=self.driver)
+
+
 FEMALE = FakeVoice("Microsoft Hazel Desktop - English (Great Britain)",
                    "id-female", "Female", ("en-GB",))
 MALE = FakeVoice("Microsoft George Desktop - English (Great Britain)",
@@ -310,6 +355,47 @@ def test_stop_speaking_interrupts_remaining_chunks():
         config.CONFIG["voice"] = original
 
 
+def test_sapi_path_speaks_all_chunks_with_selected_voice():
+    original = dict(config.CONFIG["voice"])
+    config.CONFIG["voice"]["tts_sentence_pause_ms"] = 0
+    config.CONFIG["voice"]["tts_rate"] = 160
+    config.CONFIG["voice"]["tts_volume"] = 0.7
+    # Isolate from the user's persisted preference (auto, mixed or english).
+    config.CONFIG["voice"]["voice_gender"] = "male"
+    config.CONFIG["voice"]["voice_name"] = ""
+    try:
+        engine = FakeSapiEngine([FEMALE, MALE])
+        speaker = Speaker(engine=engine, catalog=catalog_of(FEMALE, MALE))
+        ok = speaker.speak("One. Two. Three.")
+        driver = engine.driver
+        return (ok is True and driver._tts.said == ["One.", "Two.", "Three."]
+                and driver._tts.purged == 0
+                and driver.props["voice"] == "id-male"
+                and driver.props["rate"] == 160
+                and driver.props["volume"] == 0.7)
+    finally:
+        config.CONFIG["voice"] = original
+
+
+def test_stop_purges_mid_sentence():
+    original = dict(config.CONFIG["voice"])
+    config.CONFIG["voice"]["tts_sentence_pause_ms"] = 0
+    try:
+        engine = FakeSapiEngine([MALE])
+        speaker = Speaker(engine=engine, catalog=catalog_of(MALE))
+        tts = engine.driver._tts
+
+        def stop_once():
+            if tts.said == ["One."] and tts.pending == 1 and not tts.purged:
+                speaker.stop_speaking()
+
+        tts.hook = stop_once
+        spoke = speaker.speak("One. Two. Three. Four.")
+        return (spoke is True and tts.purged == 1 and tts.said == ["One."])
+    finally:
+        config.CONFIG["voice"] = original
+
+
 def test_text_only_mode_speaks_nothing():
     engine = FakeEngine([MALE])
     speaker = Speaker(engine=engine, catalog=catalog_of(MALE))
@@ -393,6 +479,9 @@ TESTS = [
      test_speak_uses_chunks_in_order),
     ("stop speaking interrupts remaining sentences",
      test_stop_speaking_interrupts_remaining_chunks),
+    ("SAPI path speaks every chunk with the chosen voice",
+     test_sapi_path_speaks_all_chunks_with_selected_voice),
+    ("stop purges the utterance mid-sentence", test_stop_purges_mid_sentence),
     ("text-only mode produces no speech", test_text_only_mode_speaks_nothing),
     ("no engine degrades without raising", test_speak_without_engine_fails_gracefully),
     ("real TTS engine initialises and selects a male voice",

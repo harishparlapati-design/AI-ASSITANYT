@@ -38,6 +38,17 @@
     "verify_voice": false,
     "voice_profile_path": "hareesh_voice_profile.pkl"
   },
+  "language": {
+    "preference": "auto"
+  },
+  "appearance": {
+    "theme": "system"
+  },
+  "integrations": {
+    "codex_enabled": true,
+    "claude_enabled": true,
+    "github_enabled": true
+  },
   "security": {
     "require_confirmation_for": "sensitive",
     "allowed_dirs": []
