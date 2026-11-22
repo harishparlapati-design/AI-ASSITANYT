@@ -551,6 +551,122 @@ def create_app():
         result = cancel_agent(task_id)
         return jsonify(result), (200 if result.get("ok") else 400)
 
+    # ---------------- background jobs (documents, media) ----------------
+
+    @app.get("/api/jobs")
+    def jobs_list():
+        from .jobs import get_jobs
+        kind = request.args.get("kind") or None
+        limit = request.args.get("limit", "30")
+        try:
+            limit = int(limit)
+        except ValueError:
+            limit = 30
+        return jsonify({"jobs": get_jobs().list(kind=kind, limit=limit)})
+
+    @app.get("/api/jobs/<job_id>")
+    def job_state(job_id):
+        from .jobs import get_jobs
+        job = get_jobs().get(job_id)
+        if not job:
+            return jsonify({"error": "unknown job"}), 404
+        return jsonify(job.public())
+
+    @app.post("/api/jobs/<job_id>/cancel")
+    def job_cancel(job_id):
+        from .jobs import get_jobs
+        result = get_jobs().cancel(job_id)
+        return jsonify(result), (200 if result.get("ok") else 400)
+
+    # ---------------- generated documents ----------------
+
+    _DOC_ID = __import__("re").compile(r"^[A-Za-z0-9_-]{1,64}$")
+    _DOC_MIME = {
+        "pdf": "application/pdf",
+        "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "csv": "text/csv", "txt": "text/plain", "md": "text/markdown",
+    }
+
+    @app.get("/api/documents")
+    def documents_index():
+        from .docgen import listing
+        try:
+            limit = int(request.args.get("limit", "30"))
+        except ValueError:
+            limit = 30
+        return jsonify({"documents": listing(limit=limit)})
+
+    @app.post("/api/documents/generate")
+    def documents_generate():
+        """Queue a real document build. Drafting text runs on a worker job."""
+        from .docgen import FORMATS
+        from .jobs import get_jobs
+        payload = request.get_json(silent=True) or {}
+        fmt = str(payload.get("format") or "").strip().lower().lstrip(".")
+        if fmt not in FORMATS:
+            return jsonify({"error": f"format must be one of {', '.join(FORMATS)}"}), 400
+        instructions = str(payload.get("instructions") or "").strip()
+        content = payload.get("content")
+        if content is not None and not isinstance(content, (str, dict)):
+            return jsonify({"error": "content must be text or an object"}), 400
+        if not instructions and content is None:
+            return jsonify({"error": "give instructions or content"}), 400
+        if len(instructions) > 8000:
+            return jsonify({"error": "instructions are limited to 8000 characters"}), 413
+        if isinstance(content, str) and len(content) > 200000:
+            return jsonify({"error": "content is limited to 200000 characters"}), 413
+        title = str(payload.get("title") or "").strip()[:160]
+        job_payload = {
+            "format": fmt, "title": title, "instructions": instructions,
+            "content": content,
+            "subtitle": str(payload.get("subtitle") or "").strip()[:200],
+        }
+
+        def _build(job):
+            from .docgen import generate_document
+            drafting = bool(instructions) and content is None
+            job.update(progress=15, message="drafting content" if drafting else "writing file")
+            result = generate_document(job_payload)
+            if job.cancelled:
+                return {"cancelled": True}
+            if not result.get("ok"):
+                raise RuntimeError(result.get("error") or "generation failed")
+            job.update(progress=92, message="validated")
+            return result
+
+        job = get_jobs().submit("document", f"{fmt.upper()} · {title or 'document'}",
+                                _build, meta={"format": fmt, "title": title})
+        return jsonify({"job": job}), 202
+
+    @app.get("/api/documents/<doc_id>")
+    def document_preview(doc_id):
+        from .docgen import preview
+        if not _DOC_ID.match(str(doc_id or "")):
+            return jsonify({"error": "invalid document id"}), 400
+        data = preview(doc_id)
+        if not data:
+            return jsonify({"error": "document not found"}), 404
+        data.pop("path", None)          # never expose server paths
+        return jsonify(data)
+
+    @app.get("/api/documents/<doc_id>/download")
+    def document_download(doc_id):
+        from flask import send_file
+        from .docgen import get
+        if not _DOC_ID.match(str(doc_id or "")):
+            return jsonify({"error": "invalid document id"}), 400
+        doc = get(doc_id)
+        if not doc:
+            return jsonify({"error": "document not found"}), 404
+        response = send_file(doc["path"], as_attachment=True,
+                             download_name=doc["name"],
+                             mimetype=_DOC_MIME.get(doc["format"], "application/octet-stream"))
+        response.headers["Cache-Control"] = "private, no-store"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        return response
+
     # subscribe_once: a second app object in the same process must not double
     # every event on the existing stream.
     events.subscribe_once(_q_listener)
@@ -706,6 +822,18 @@ _INDEX_HTML = """<!doctype html>
   #mem,#llm,#tools { color:var(--tx);font-size:11px;line-height:1.7; }
   #toolcount { color:var(--tx); }
   .detail-grid { display:grid;grid-template-columns:minmax(320px,1.1fr) minmax(280px,.85fr) minmax(320px,1fr);gap:15px;margin-top:15px; }
+  .create-panel { margin-top:15px;padding:16px; }
+  .create-grid { display:grid;grid-template-columns:minmax(300px,1fr) minmax(320px,1.15fr);gap:16px; }
+  .create-controls textarea { min-height:118px;margin-bottom:2px; }
+  .create-controls .inline-form select { max-width:188px; }
+  .create-output { min-width:0; }
+  .doc-list { display:flex;flex-direction:column;gap:6px;max-height:236px;overflow:auto; }
+  .doc-row { display:flex;align-items:center;gap:9px;padding:7px 9px;border:1px solid var(--line);border-radius:10px;background:var(--surface-soft); }
+  .doc-row a { flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600; }
+  .doc-row .helper { white-space:nowrap; }
+  .doc-preview { margin:8px 0 0;max-height:230px;overflow:auto;padding:10px;border:1px solid var(--line);border-radius:10px;background:var(--input);font:11px/1.5 ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-word;color:var(--tx); }
+  .job-track { height:5px;border-radius:3px;background:var(--surface-soft);overflow:hidden;margin-top:8px; }
+  #docJobBar { height:100%;width:0;background:linear-gradient(90deg,var(--acc),var(--ok));transition:width .3s; }
   .detail-panel { padding:16px;min-width:0; }
   .detail-panel > p { margin:-4px 0 12px;color:var(--dim);font-size:11px; }
   .section-title { display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px; }
@@ -767,6 +895,7 @@ _INDEX_HTML = """<!doctype html>
     .rightbar { grid-column:auto;display:grid;grid-template-columns:1fr; }
     .detail-grid { grid-template-columns:1fr;gap:10px;margin-top:10px; }
     .detail-panel.plugins { grid-column:auto; }
+    .create-grid { grid-template-columns:1fr; }
   }
       @media (max-width:420px) {
     .topbar { flex-direction:column; align-items:stretch; }
@@ -896,6 +1025,37 @@ _INDEX_HTML = """<!doctype html>
       <p>Connection status comes from Harry’s tool registry, local CLIs, Git checkout, and GitHub authentication.</p>
       <div id="pluginGrid" class="integration-list">Checking installed integrations…</div>
     </section>
+  </section>
+  <section class="panel detail-panel create-panel">
+    <div class="section-title"><h2>Create files</h2><button id="docRefresh" class="ghost small-btn">Refresh list</button></div>
+    <p>Real files written to disk, then reopened with the library that wrote them before they are listed. Generation runs as a background job, so chatting stays responsive.</p>
+    <div class="create-grid">
+      <div class="create-controls">
+        <div class="inline-form">
+          <select id="docFormat" aria-label="Document format">
+            <option value="pdf">PDF document</option>
+            <option value="docx">Word (DOCX)</option>
+            <option value="xlsx">Excel (XLSX)</option>
+            <option value="pptx">PowerPoint (PPTX)</option>
+            <option value="csv">CSV data</option>
+            <option value="txt">Plain text</option>
+            <option value="md">Markdown</option>
+          </select>
+          <input id="docTitle" type="text" maxlength="160" placeholder="Title (optional)">
+        </div>
+        <textarea id="docPrompt" maxlength="8000" placeholder="Describe the document, or paste the content. Example: a one-page project plan with milestones, owners and a risk table."></textarea>
+        <div class="inline-form">
+          <button id="docGenerate">Generate document</button>
+          <button id="docCancel" class="ghost" disabled>Cancel</button>
+        </div>
+        <div id="docStatus" class="helper" role="status" aria-live="polite"></div>
+        <div id="docJob" class="job-track" hidden><div id="docJobBar"></div></div>
+      </div>
+      <div class="create-output">
+        <div id="docList" class="doc-list"><div class="info-card">No generated documents yet.</div></div>
+        <pre id="docPreview" class="doc-preview" hidden></pre>
+      </div>
+    </div>
   </section>
 </div>
 <script>
@@ -1881,6 +2041,149 @@ document.getElementById('cancelAgent').addEventListener('click', async function(
 
 loadPreferences().then(function(){ refreshIntegrations(true); });
 loadVoice();
+
+/* ---------------- document generation ---------------- */
+let docJobId = null, docJobTimer = null;
+
+function formatBytes(n){
+  n = Number(n) || 0;
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+function endDocJob(){
+  if (docJobTimer){ clearTimeout(docJobTimer); docJobTimer = null; }
+  docJobId = null;
+  const generate = document.getElementById('docGenerate');
+  const cancel = document.getElementById('docCancel');
+  if (generate) generate.disabled = false;
+  if (cancel) cancel.disabled = true;
+}
+
+async function refreshDocuments(){
+  const box = document.getElementById('docList');
+  if (!box) return;
+  try {
+    const data = await (await fetch('/api/documents')).json();
+    box.innerHTML = '';
+    if (!(data.documents || []).length){
+      const empty = document.createElement('div');
+      empty.className = 'info-card';
+      empty.textContent = 'No generated documents yet.';
+      box.appendChild(empty);
+      return;
+    }
+    data.documents.forEach(function(d){
+      const row = document.createElement('div');
+      row.className = 'doc-row';
+      const link = document.createElement('a');
+      link.href = '/api/documents/' + encodeURIComponent(d.id) + '/download';
+      link.textContent = d.name;
+      link.title = 'Download ' + d.name;
+      const meta = document.createElement('span');
+      meta.className = 'helper';
+      meta.textContent = String(d.format || '').toUpperCase() + ' · ' + formatBytes(d.bytes);
+      const view = document.createElement('button');
+      view.className = 'ghost small-btn';
+      view.textContent = 'Preview';
+      view.addEventListener('click', function(){ previewDocument(d.id); });
+      row.appendChild(link); row.appendChild(meta); row.appendChild(view);
+      box.appendChild(row);
+    });
+  } catch (e) {
+    box.textContent = 'Could not load generated documents: ' + humanError(e);
+  }
+}
+
+async function previewDocument(id){
+  const box = document.getElementById('docPreview');
+  if (!box) return;
+  box.hidden = false;
+  box.textContent = 'Loading preview…';
+  try {
+    const doc = await (await fetch('/api/documents/' + encodeURIComponent(id))).json();
+    if (doc.error) throw new Error(doc.error);
+    const facts = doc.validation || {};
+    const bits = [doc.name, formatBytes(doc.bytes)];
+    if (facts.pages) bits.push(facts.pages + ' pages');
+    if (facts.slides) bits.push(facts.slides + ' slides');
+    if (facts.sheets) bits.push(facts.sheets.length + ' sheets');
+    if (facts.rows) bits.push(facts.rows + ' rows');
+    if (facts.cells) bits.push(facts.cells + ' cells');
+    box.textContent = bits.join(' · ') + '\n\n' + (doc.preview || '(no inline preview for this format)');
+  } catch (e) {
+    box.textContent = 'Preview failed: ' + humanError(e);
+  }
+}
+
+async function pollDocJob(){
+  const status = document.getElementById('docStatus');
+  const bar = document.getElementById('docJobBar');
+  if (!docJobId) return;
+  try {
+    const job = await (await fetch('/api/jobs/' + encodeURIComponent(docJobId))).json();
+    if (job.error && job.state === undefined) throw new Error(job.error);
+    if (bar) bar.style.width = (job.progress || 0) + '%';
+    if (status) status.textContent = (job.message || job.state) + ' · ' + (job.progress || 0) + '%';
+    if (job.state === 'done'){
+      const name = job.result && job.result.name ? job.result.name : 'document';
+      if (status) status.textContent = 'Created ' + name + '. Reopened and validated.';
+      const id = job.result && job.result.id;
+      endDocJob();
+      await refreshDocuments();
+      if (id) previewDocument(id);
+    } else if (job.state === 'error' || job.state === 'cancelled'){
+      if (status) status.textContent = job.state === 'error'
+        ? 'Generation failed: ' + (job.error || 'unknown error') : 'Generation cancelled.';
+      endDocJob();
+    } else {
+      docJobTimer = setTimeout(pollDocJob, 700);
+    }
+  } catch (e) {
+    if (status) status.textContent = 'Lost track of the generation job: ' + humanError(e);
+    endDocJob();
+  }
+}
+
+document.getElementById('docGenerate').addEventListener('click', async function(){
+  const status = document.getElementById('docStatus');
+  const prompt = document.getElementById('docPrompt').value.trim();
+  const title = document.getElementById('docTitle').value.trim();
+  const format = document.getElementById('docFormat').value;
+  if (!prompt){ status.textContent = 'Describe the document or paste its content first.'; return; }
+  this.disabled = true;
+  document.getElementById('docCancel').disabled = false;
+  document.getElementById('docJob').hidden = false;
+  document.getElementById('docJobBar').style.width = '0%';
+  status.textContent = 'Queueing…';
+  try {
+    const data = await postJSON('/api/documents/generate', {
+      format: format, title: title, instructions: prompt
+    });
+    docJobId = data.job.id;
+    pollDocJob();
+  } catch (e) {
+    status.textContent = 'Could not start generation: ' + humanError(e);
+    endDocJob();
+  }
+});
+
+document.getElementById('docCancel').addEventListener('click', async function(){
+  if (!docJobId) return;
+  this.disabled = true;
+  try { await postJSON('/api/jobs/' + encodeURIComponent(docJobId) + '/cancel', {}); }
+  catch (e) { sys('⚠ ' + humanError(e)); }
+});
+
+document.getElementById('docRefresh').addEventListener('click', refreshDocuments);
+es.addEventListener('document_ready', function(e){
+  let d = {};
+  try { d = JSON.parse(e.data); } catch (_) {}
+  refreshDocuments();
+  if (d && d.name) sys('document ready: ' + d.name);
+});
+refreshDocuments();
 
 addMsg('sys', 'Harry ready. Type, or press 🎤 to talk. Voice and text share this conversation.');
 refreshState();

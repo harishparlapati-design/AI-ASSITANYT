@@ -599,6 +599,8 @@ def register_builtins(registry):
     from .math_tools import register_math_tools
     from .research import register_research_tools
     from .documents import register_document_tools
+    from .docgen import register_document_generation_tools
     register_math_tools(registry)
     register_research_tools(registry)
     register_document_tools(registry)
+    register_document_generation_tools(registry)
