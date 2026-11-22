@@ -116,7 +116,10 @@ def main():
     get_scheduler().start()   # proactive reminders / briefing (user-configurable)
     warm_models_in_background()
 
-    if not args.text:
+    # --ui runs the UI below on the main thread; starting the thread too would
+    # build a second app (and a second event-bus subscription), so every event
+    # would be delivered twice.
+    if not args.text and not args.ui:
         start_ui_thread()
 
     if args.voice and not args.ui:

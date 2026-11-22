@@ -703,6 +703,11 @@ class Listener:
         self.model_path = runtime_paths.find_asset(model) if not os.path.isabs(model) else model
         self._model = None
         self._available = None
+        # Loading the Vosk model is a multi-minute cold-disk read on some
+        # machines. It must never happen inside a voice turn: a turn that waits
+        # on it looks like a frozen microphone.
+        self._model_lock = threading.Lock()
+        self._loading = False
 
     def available(self):
         if self._available is None:
@@ -715,13 +720,52 @@ class Listener:
 
     def _get_model(self):
         if self._model is None:
-            from vosk import Model
-            self._model = Model(self.model_path)
+            with self._model_lock:
+                if self._model is None:
+                    from vosk import Model
+                    self._model = Model(self.model_path)
         return self._model
 
-    def listen_once(self, samplerate=16000, silence_blocks=4, max_seconds=20):
-        """Record until speech starts then ends; return recognized text ('' if none)."""
+    def model_ready(self):
+        """True once the recognizer is actually loaded."""
+        return self._model is not None
+
+    def warm(self):
+        """Start loading the model in the background; returns immediately."""
+        if self._model is not None:
+            return True
+        with self._model_lock:
+            if self._loading:
+                return False
+            self._loading = True
+
+        def _load():
+            try:
+                self._get_model()
+                log.info("speech model ready: %s", os.path.basename(self.model_path))
+            except Exception as e:
+                log.warning("speech model failed to load: %s", e)
+            finally:
+                self._loading = False
+
+        threading.Thread(target=_load, daemon=True, name="vosk-warm").start()
+        return False
+
+    def listen_once(self, samplerate=16000, silence_blocks=4, max_seconds=20,
+                    min_volume=500, ignore_while_speaking=True):
+        """Record until speech starts then ends; return recognized text ('' if none).
+
+        ``min_volume`` is the VAD threshold and ``silence_blocks`` the number of
+        silent blocks that end an utterance. ``ignore_while_speaking`` refuses
+        to record while Harry's own audio is playing, so his voice is never
+        transcribed as the user's; barge-in turns it off on purpose.
+        """
         if not self.available():
+            return ""
+        if not self.model_ready():
+            self.warm()                     # keep loading, never block the turn
+            return ""
+        if ignore_while_speaking and get_speaker().speaking:
             return ""
         try:
             import numpy as np
@@ -742,7 +786,9 @@ class Listener:
                     volume = float(np.sqrt(np.mean(audio.astype(np.float32) ** 2)))
                     if events.is_stopped():
                         return ""
-                    if volume < 500:
+                    if ignore_while_speaking and get_speaker().speaking:
+                        return ""      # Harry started talking mid-capture
+                    if volume < min_volume:
                         if not speech_started:
                             continue
                         silence += 1
@@ -774,6 +820,9 @@ class Listener:
         """
         if not pcm_bytes or not self.available():
             return ""
+        if not self.model_ready():
+            self.warm()
+            return ""                         # caller reports "not ready yet"
         try:
             from vosk import KaldiRecognizer
             rec = KaldiRecognizer(self._get_model(), samplerate)

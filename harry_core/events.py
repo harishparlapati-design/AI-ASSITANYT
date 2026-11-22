@@ -37,6 +37,19 @@ def subscribe(callback, event=None):
         _listeners.append((event, callback, None))
 
 
+def subscribe_once(callback, event=None):
+    """Register callback unless this exact callback and filter already exist.
+
+    A second registration would deliver every event twice to that callback -
+    which reaches the browser as duplicated text.
+    """
+    with _lock:
+        if any(c is callback and n == event for (n, c, _q) in _listeners):
+            return False
+        _listeners.append((event, callback, None))
+        return True
+
+
 def unsubscribe(callback):
     with _lock:
         _listeners[:] = [(n, c, q) for (n, c, q) in _listeners if c is not callback]

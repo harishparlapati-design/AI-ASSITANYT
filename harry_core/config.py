@@ -82,6 +82,17 @@ DEFAULTS = {
         "tts_read_numbers": True,          # "2026" -> "two thousand and twenty six"
         "tts_expand_abbreviations": True,  # "e.g." -> "for example"
         "output_mode": "both",             # text | voice | both
+        # Continuous conversation controller (harry_core/conversation.py).
+        # push_to_talk waits for an explicit trigger; continuous listens all
+        # the time. The microphone stays closed while Harry speaks.
+        "conversation": {
+            "mode": "push_to_talk",         # push_to_talk | continuous
+            "barge_in": True,              # phrase-based interruption
+            "vad_min_volume": 450,         # RMS threshold for speech
+            "vad_silence_blocks": 4,       # silence blocks that end a turn
+            "max_utterance_seconds": 20,
+            "barge_max_seconds": 4,
+        },
         "verify_voice": False,             # voiceprint check on wake
         "verify_threshold": 0.43,
         "voice_profile_path": "hareesh_voice_profile.pkl",

@@ -175,6 +175,12 @@ class Brain:
         self._speech_thread = None
         self._speech_lock = threading.Lock()
         self._speaking = threading.Event()
+        # Items queued but not finished. Checked by wait_speech(): the queue
+        # alone is not enough, because the worker removes an item before it
+        # starts speaking, which is exactly the window where the microphone
+        # used to open while Harry was still about to talk.
+        self._speech_pending = 0
+        self._last_spoken = ""
 
     # ------------------------------------------------------------------ speech
 
@@ -195,23 +201,29 @@ class Brain:
             item = q.get()
             if item is None:
                 return
-            text = item
-            if events.is_stopped():
-                continue
-            self._speaking.set()
             try:
-                self.speaker.speak(text)
-            except Exception as e:
-                log.warning("queued speech failed: %s", e)
+                if not events.is_stopped():
+                    self._speaking.set()
+                    try:
+                        self.speaker.speak(item)
+                    except Exception as e:
+                        log.warning("queued speech failed: %s", e)
+                    finally:
+                        self._speaking.clear()
             finally:
-                self._speaking.clear()
+                with self._speech_lock:
+                    self._speech_pending = max(0, self._speech_pending - 1)
 
     def _enqueue_speech(self, text):
         """Speak without blocking the caller (used by the dashboard)."""
         try:
             self._ensure_speech_worker()
+            with self._speech_lock:
+                self._speech_pending += 1
             self._speech_q.put(text)
         except Exception as e:
+            with self._speech_lock:
+                self._speech_pending = max(0, self._speech_pending - 1)
             log.warning("could not queue speech: %s", e)
 
     DELTA_FLUSH_SECONDS = 0.05
@@ -239,13 +251,20 @@ class Brain:
         return on_delta
 
     def wait_speech(self, timeout=120.0):
-        """Block until every queued sentence has finished playing."""
+        """Block until every queued sentence has finished playing.
+
+        Returns True when the audio really is over. Callers that are about to
+        open the microphone MUST honour this: it is the only thing standing
+        between the user's ear and Harry transcribing himself.
+        """
         deadline = time.time() + timeout
         while time.time() < deadline:
-            q = self._speech_q
-            if (q is None or q.empty()) and not self._speaking.is_set():
-                return
-            time.sleep(0.05)
+            with self._speech_lock:
+                pending = self._speech_pending
+            if pending == 0 and not self._speaking.is_set():
+                return True
+            time.sleep(0.02)
+        return False
 
     def stop(self):
         """Emergency stop: cancel queued speech and halt current playback."""
@@ -254,6 +273,8 @@ class Brain:
                 self._speech_q.get_nowait()
         except Exception:
             pass
+        with self._speech_lock:
+            self._speech_pending = 0
         self.speaker.stop_speaking()
 
     @property
@@ -261,7 +282,8 @@ class Brain:
         """True while Harry is producing speech or has speech queued."""
         if self._speaking.is_set():
             return True
-        return not (self._speech_q is None or self._speech_q.empty())
+        with self._speech_lock:
+            return self._speech_pending > 0
 
     # ------------------------------------------------------------------ output
 
@@ -294,6 +316,9 @@ class Brain:
             # been spoken sentence by sentence during generation.
             to_speak = text if speech_text is None else speech_text
             if str(to_speak).strip():
+                # Remembered so barge-in can tell the user's voice from an echo
+                # of Harry's own words.
+                self._last_spoken = str(to_speak)
                 # Always go through the worker: it keeps sentence order intact
                 # when part of the answer was already spoken during generation.
                 self._enqueue_speech(to_speak)

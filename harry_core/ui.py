@@ -36,10 +36,19 @@ log = logging.getLogger("harry.ui")
 _flask = None
 
 
+_event_seq = 0
+_seq_lock = threading.Lock()
+
+
 def _q_listener(event, data):
+    """Fan one event out to every open stream, with a monotonic sequence id."""
+    global _event_seq
+    with _seq_lock:
+        _event_seq += 1
+        seq = _event_seq
     for q in list(_queues):
         try:
-            q.put_nowait({"event": event, "data": data})
+            q.put_nowait({"event": event, "data": data, "seq": seq})
         except Exception:
             pass
 
@@ -223,7 +232,8 @@ def create_app():
                 while True:
                     try:
                         item = q.get(timeout=15)
-                        yield (f"event: {item['event']}\n"
+                        yield (f"id: {item.get('seq', 0)}\n"
+                               f"event: {item['event']}\n"
                                f"data: {json.dumps(item['data'], ensure_ascii=False)}\n\n")
                     except queue.Empty:
                         yield ": keepalive\n\n"
@@ -233,6 +243,28 @@ def create_app():
 
         return Response(gen(), mimetype="text/event-stream",
                         headers={"Cache-Control": "no-cache"})
+
+    @app.get("/api/conversation")
+    def conversation_status():
+        from .conversation import get_conversation
+        return jsonify(get_conversation().status())
+
+    @app.post("/api/conversation")
+    def conversation_control():
+        """Start/stop/mute the continuous voice loop or trigger push-to-talk."""
+        from .conversation import get_conversation
+        payload = request.get_json(silent=True) or {}
+        action = str(payload.get("action") or "").strip()
+        conversation = get_conversation()
+        if action == "start":
+            return jsonify(conversation.start(mode=payload.get("mode")))
+        if action == "stop":
+            return jsonify(conversation.stop())
+        if action == "mute":
+            return jsonify(conversation.mute(bool(payload.get("muted", True))))
+        if action == "trigger":
+            return jsonify(conversation.trigger())
+        return jsonify({"error": "unknown action"}), 400
 
     @app.get("/api/timing")
     def timing_recent():
@@ -519,7 +551,9 @@ def create_app():
         result = cancel_agent(task_id)
         return jsonify(result), (200 if result.get("ok") else 400)
 
-    events.subscribe(_q_listener)
+    # subscribe_once: a second app object in the same process must not double
+    # every event on the existing stream.
+    events.subscribe_once(_q_listener)
     _flask = app
     return app
 
@@ -971,7 +1005,8 @@ function onAnswer(text, rid){
   if (draft){
     if (text) draft.textContent = text;
     draft.className = 'msg harry';
-  } else if (text){
+    if (key) seen.add(key);      // the final answer already occupies this bubble
+  } else if (text && !(key && seen.has(key))){
     addMsg('harry', text, key);
   }
   setTimeout(refreshState, 500);
@@ -1266,19 +1301,32 @@ document.getElementById('stop').addEventListener('click', async function(){
 
 const es = new EventSource('/api/stream');
 
+/* A duplicate delivery (double subscription, or an SSE retry) must never append
+   the same text twice. The server stamps every frame with a sequence id. */
+let lastEventSeq = 0;
+function freshEvent(e){
+  const seq = Number(e.lastEventId || 0);
+  if (seq && seq <= lastEventSeq) return false;
+  if (seq) lastEventSeq = seq;
+  return true;
+}
+
 es.addEventListener('assistant_message', function(e){
+  if (!freshEvent(e)) return;
   let d = {};
   try { d = JSON.parse(e.data); } catch (_) {}
   onAnswer(d.text || '', d.request_id);
 });
 
 es.addEventListener('assistant_delta', function(e){
+  if (!freshEvent(e)) return;
   let d = {};
   try { d = JSON.parse(e.data); } catch (_) {}
   onStream(d.text || '', d.request_id);
 });
 
 es.addEventListener('user_message', function(e){
+  if (!freshEvent(e)) return;
   let d = {};
   try { d = JSON.parse(e.data); } catch (_) {}
   if (d.source === 'ui' || d.source === 'ui-voice') return;   // already rendered locally
@@ -2035,8 +2083,19 @@ function onAssistant(data) {
 }
 
 const es = new EventSource('/api/stream');
-es.addEventListener('assistant_message', function(m){ onAssistant(JSON.parse(m.data)); });
+let lastEventSeq = 0;
+function freshEvent(e){
+  const seq = Number(e.lastEventId || 0);
+  if (seq && seq <= lastEventSeq) return false;
+  if (seq) lastEventSeq = seq;
+  return true;
+}
+es.addEventListener('assistant_message', function(m){
+  if (!freshEvent(m)) return;
+  onAssistant(JSON.parse(m.data));
+});
 es.addEventListener('assistant_delta', function(m){
+  if (!freshEvent(m)) return;
   const d = JSON.parse(m.data);
   onStream(d.text || '', d.request_id);
 });

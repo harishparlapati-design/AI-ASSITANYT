@@ -37,6 +37,14 @@
     "tts_read_numbers": true,
     "tts_expand_abbreviations": true,
     "output_mode": "both",
+    "conversation": {
+      "mode": "push_to_talk",
+      "barge_in": true,
+      "vad_min_volume": 450,
+      "vad_silence_blocks": 4,
+      "max_utterance_seconds": 20,
+      "barge_max_seconds": 4
+    },
     "verify_voice": false,
     "voice_profile_path": "hareesh_voice_profile.pkl"
   },
