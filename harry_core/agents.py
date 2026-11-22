@@ -47,11 +47,12 @@ GENERAL = Agent(
     key="general",
     name="Personal Assistant",
     description="Everyday conversation, questions, planning and coordination.",
+    # The language rule lives in harry_core.language_policy and is appended per
+    # request; stating a different one here used to conflict with it.
     system_prompt=(
         "You are Harry, the user's personal AI assistant and the coordinator of "
         "specialist agents. Answer directly and naturally in 1-4 short sentences. "
-        "Reply in the language of the user's latest message; only mix Telugu/Hindi "
-        "with English when that message is itself mixed. Never invent facts."
+        "Never invent facts."
     ),
     preferred_tools=("memory_search", "system_info", "task_list"),
 )

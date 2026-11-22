@@ -25,7 +25,7 @@ import time
 import uuid
 from datetime import datetime
 
-from . import config, events
+from . import config, events, timing
 from .memory import get_memory
 from .speech import get_speaker
 from .task_engine import get_engine
@@ -119,6 +119,52 @@ def _safe_arithmetic(expr):
         return None
 
 
+_SENTENCE_END = re.compile(r"[.!?](?=\s|$)")
+
+
+class _SpeechStream:
+    """Speak complete sentences while the rest of the answer is generated.
+
+    TTS runs on its own worker thread, so feeding sentences here never slows
+    the model down. ``remainder()`` returns what was not spoken yet, which is
+    all the final ``say`` call has to queue.
+    """
+
+    MAX_CHUNK = 220
+
+    def __init__(self, speak, enabled=True):
+        self._speak = speak
+        self.enabled = bool(enabled)
+        self.buf = ""
+        self.spoken = 0
+
+    def feed(self, piece):
+        if not self.enabled or not piece:
+            return
+        self.buf += piece
+        while True:
+            match = _SENTENCE_END.search(self.buf)
+            if match:
+                cut = match.end()
+            elif len(self.buf) >= self.MAX_CHUNK:
+                cut = self.buf.rfind(" ", 0, self.MAX_CHUNK)
+                if cut <= 0:
+                    return
+            else:
+                return
+            sentence, self.buf = self.buf[:cut].strip(), self.buf[cut:].lstrip()
+            if sentence:
+                self.spoken += len(sentence)
+                try:
+                    self._speak(sentence)
+                except Exception as e:
+                    log.debug("early speech failed: %s", e)
+
+    def remainder(self):
+        rest, self.buf = self.buf.strip(), ""
+        return rest
+
+
 class Brain:
     def __init__(self):
         self.memory = get_memory()
@@ -168,18 +214,37 @@ class Brain:
         except Exception as e:
             log.warning("could not queue speech: %s", e)
 
-    def wait_speech(self, timeout=30.0):
-        """Block until queued speech is done (used on shutdown)."""
-        t = self._speech_thread
-        if not t or not t.is_alive():
-            return
+    DELTA_FLUSH_SECONDS = 0.05
+
+    def _delta_handler(self, rid, stream):
+        """Forward answer fragments to the dashboard and to early speech."""
+        state = {"buf": "", "at": 0.0, "visible": False}
+
+        def on_delta(piece):
+            if not piece:
+                return
+            stream.feed(piece)
+            state["buf"] += piece
+            now = time.perf_counter()
+            if now - state["at"] < self.DELTA_FLUSH_SECONDS and len(state["buf"]) < 240:
+                return
+            state["at"] = now
+            if not state["visible"]:
+                state["visible"] = True
+                timing.mark("first_visible")
+            events.emit("assistant_delta", {"request_id": rid,
+                                            "text": state["buf"]})
+            state["buf"] = ""
+
+        return on_delta
+
+    def wait_speech(self, timeout=120.0):
+        """Block until every queued sentence has finished playing."""
         deadline = time.time() + timeout
         while time.time() < deadline:
             q = self._speech_q
-            if q is None or q.empty():
-                time.sleep(0.1)
-                if q is None or q.empty():
-                    return
+            if (q is None or q.empty()) and not self._speaking.is_set():
+                return
             time.sleep(0.05)
 
     def stop(self):
@@ -201,7 +266,7 @@ class Brain:
     # ------------------------------------------------------------------ output
 
     def say(self, text, force_voice=False, request_id=None, wait=True,
-            latency_ms=None):
+            latency_ms=None, speech_text=None):
         """Deliver an answer as text (+ voice per output mode). Exactly once."""
         if text is None:
             return
@@ -225,14 +290,15 @@ class Brain:
 
         mode = config.CONFIG.get("voice", {}).get("output_mode", "both")
         if mode in ("voice", "both") or force_voice:
-            if wait:
-                self._speaking.set()
-                try:
-                    self.speaker.speak(text)
-                finally:
-                    self._speaking.clear()
-            else:
-                self._enqueue_speech(text)
+            # speech_text lets a streamed answer speak only what has not already
+            # been spoken sentence by sentence during generation.
+            to_speak = text if speech_text is None else speech_text
+            if str(to_speak).strip():
+                # Always go through the worker: it keeps sentence order intact
+                # when part of the answer was already spoken during generation.
+                self._enqueue_speech(to_speak)
+                if wait:
+                    self.wait_speech()
 
     # ------------------------------------------------------------------ input
 
@@ -250,6 +316,7 @@ class Brain:
         rid = request_id or uuid.uuid4().hex[:12]
         wait_speech = source not in ("ui", "ui-voice")
         t_start = time.perf_counter()
+        trace = timing.start(rid, source)
         log.info("[%s] request received (source=%s, len=%s)", rid, source, len(text))
 
         self.memory.conversation.add("user", text, meta={"source": source})
@@ -257,14 +324,20 @@ class Brain:
                                      "request_id": rid})
         low = text.lower()
 
+        stream = None
+
         def finish(answer):
             # Record the answer for EVERY path (fast path, memory command, tool
             # task, model answer). Without this the history accumulated several
             # unanswered user turns and the model tried to answer all of them.
             self.memory.conversation.add("assistant", str(answer),
                                          meta={"request_id": rid})
+            speech_rest = stream.remainder() if stream is not None else None
             self.say(answer, request_id=rid, wait=wait_speech,
-                     latency_ms=(time.perf_counter() - t_start) * 1000)
+                     latency_ms=(time.perf_counter() - t_start) * 1000,
+                     speech_text=speech_rest)
+            trace.mark("delivered")
+            trace.finish()
             log.info("[%s] answered in %.0fms", rid,
                      (time.perf_counter() - t_start) * 1000)
             return answer
@@ -287,6 +360,7 @@ class Brain:
             from .language_policy import general_fast_reply
             preference = config.CONFIG.get("language", {}).get("preference", "auto")
             fast = general_fast_reply(fast, text, preference)
+            timing.mark("fast_path")
             log.info("[%s] fast path", rid)
             return finish(fast)
 
@@ -302,12 +376,19 @@ class Brain:
             return finish(report)
 
         # ---- task / question pipeline ----
+        # Speech starts as soon as the first sentence exists instead of after
+        # the whole answer, and generation never waits for audio.
+        mode = config.CONFIG.get("voice", {}).get("output_mode", "both")
+        stream = _SpeechStream(self._enqueue_speech,
+                               enabled=mode in ("voice", "both"))
         self.busy = True
         try:
             try:
                 task = self.engine.create_task(text, request_id=rid)
+                timing.mark("task_created")
                 log.info("[%s] task %s created", rid, task["id"])
-                result = self.engine.run_task(task["id"])
+                result = self.engine.run_task(
+                    task["id"], on_delta=self._delta_handler(rid, stream))
             except events.EmergencyStop:
                 answer = "Okay, stopped that for you."
                 return finish(answer)

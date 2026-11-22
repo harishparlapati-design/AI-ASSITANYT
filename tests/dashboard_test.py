@@ -54,6 +54,15 @@ def fake_chat(messages, task_class=llm.CHAT, options=None, json_mode=False):
 
 llm.chat = fake_chat
 
+
+def fake_chat_stream(messages, task_class=llm.CHAT, options=None, json_mode=False):
+    """Answers are streamed now: yield the same canned answer once."""
+    yield fake_chat(messages, task_class=task_class, options=options,
+                    json_mode=json_mode)
+
+
+llm.chat_stream = fake_chat_stream
+
 # --------------------------------------------------------------- app under test
 from harry_core import config  # noqa: E402
 from harry_core.brain import get_brain  # noqa: E402

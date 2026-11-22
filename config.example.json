@@ -9,6 +9,7 @@
       "type": "ollama",
       "url": "http://localhost:11434",
       "chat_model": "llama3.1:latest",
+      "fast_chat_model": "",
       "reasoning_model": "qwen3:4b",
       "routing_model": "llama3.1:latest"
     },
@@ -18,7 +19,8 @@
       "api_key_env": "",
       "model": ""
     },
-    "vision_model": ""
+    "vision_model": "",
+    "warm_on_start": true
   },
   "voice": {
     "enabled": true,

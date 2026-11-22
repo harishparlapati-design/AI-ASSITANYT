@@ -22,6 +22,21 @@ from harry_core.events import is_stopped
 from harry_core.scheduler import get_scheduler
 
 
+def warm_models_in_background():
+    """Load the local chat model before the first question needs it."""
+    if not CONFIG.get("models", {}).get("warm_on_start", True):
+        return
+
+    def _load():
+        try:
+            from harry_core.llm import get_router
+            get_router().warm()
+        except Exception as e:
+            print(f"[warm-up] skipped: {e}")
+
+    threading.Thread(target=_load, daemon=True, name="model-warm").start()
+
+
 def start_ui_thread():
     from harry_core.ui import run as run_ui
     t = threading.Thread(target=run_ui, daemon=True, name="harry-ui")
@@ -99,6 +114,7 @@ def main():
 
     brain = get_brain()
     get_scheduler().start()   # proactive reminders / briefing (user-configurable)
+    warm_models_in_background()
 
     if not args.text:
         start_ui_thread()

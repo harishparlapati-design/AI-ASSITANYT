@@ -24,7 +24,7 @@ import re
 import time
 import urllib.request
 
-from . import config
+from . import config, timing
 
 log = logging.getLogger("harry.llm")
 
@@ -59,11 +59,14 @@ class OllamaProvider:
         models = self.available()
         return any(m == name or m.split(":")[0] == name.split(":")[0] for m in models)
 
-    def chat(self, model, messages, options=None, json_mode=False, _retry=0):
+    def _payload(self, model, messages, options=None, json_mode=False,
+                 stream=False):
         payload = {
             "model": model,
             "messages": messages,
-            "stream": False,
+            "stream": stream,
+            # Keep the model resident between turns: reloading a 5GB model
+            # from disk costs ~20s on this machine.
             "keep_alive": "30m",
         }
         opts = dict(options or {})
@@ -79,13 +82,19 @@ class OllamaProvider:
             opts.setdefault("num_predict", 600)
         if opts:
             payload["options"] = opts
+        return payload
+
+    def _open(self, payload):
         req = urllib.request.Request(
             self.url + "/api/chat",
             data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json"},
         )
+        return urllib.request.urlopen(req, timeout=300)
+
+    def chat(self, model, messages, options=None, json_mode=False, _retry=0):
         started = time.perf_counter()
-        with urllib.request.urlopen(req, timeout=300) as r:
+        with self._open(self._payload(model, messages, options, json_mode)) as r:
             data = json.loads(r.read().decode())
         # Timing evidence for every model call (the console and logs show what
         # the prompt actually cost versus generation).
@@ -113,6 +122,34 @@ class OllamaProvider:
                                  _retry=1)
             raise ProviderError("empty response from local model")
         return content
+
+    def chat_stream(self, model, messages, options=None, json_mode=False):
+        """Yield the answer as the local model writes it.
+
+        This is what turns a 40-second blank wait into text that starts
+        appearing in about a second on CPU-only hardware.
+        """
+        started = time.perf_counter()
+        stats = {}
+        with self._open(self._payload(model, messages, options, json_mode,
+                                      stream=True)) as r:
+            for raw in r:
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    chunk = json.loads(line)
+                except ValueError:
+                    continue
+                piece = (chunk.get("message") or {}).get("content") or ""
+                if piece:
+                    yield piece
+                if chunk.get("done"):
+                    stats = chunk
+                    break
+        log.info("llm %s (stream): prompt %s tok, generated %s tok, total %.1fs",
+                 model, stats.get("prompt_eval_count"), stats.get("eval_count"),
+                 time.perf_counter() - started)
 
 
 class OpenAICompatibleProvider:
@@ -207,6 +244,12 @@ class ModelRouter:
             ROUTING: "routing_model",
         }.get(task_class, "chat_model")
         name = m["local"].get(key)
+        if task_class == CHAT:
+            # Opt-in: on CPU-only hardware a smaller model answers much faster.
+            # Empty by default so answer quality is never silently reduced.
+            fast = m["local"].get("fast_chat_model")
+            if fast and self.local.has_model(fast):
+                return self.local, fast
 
         if provider_pref in ("auto", "local") and self.local.has_model(name):
             return self.local, name
@@ -248,6 +291,57 @@ class ModelRouter:
                 time.sleep(0.5)
         raise ProviderError(f"LLM call failed: {last_err}")
 
+    def chat_stream(self, messages, task_class=CHAT, options=None, json_mode=False):
+        """Stream an answer, falling back to one blocking call when needed."""
+        opts = dict(options or {})
+        opts.setdefault("think", task_class in (REASONING, CODING))
+        provider, model = self._pick(task_class, json_mode)
+        timing.set_model(model)
+        if json_mode or not hasattr(provider, "chat_stream"):
+            yield provider.chat(model, messages, options=opts, json_mode=json_mode)
+            return
+        emitted = False
+        try:
+            for piece in provider.chat_stream(model, messages, options=opts,
+                                              json_mode=json_mode):
+                if not emitted:
+                    emitted = True
+                    timing.first_token()
+                yield piece
+        except Exception as e:
+            if emitted:
+                # Text is already on screen; a second full answer would be
+                # worse than reporting the interruption.
+                raise ProviderError(f"stream interrupted: {e}")
+            log.warning("streaming unavailable (%s); using a blocking call", e)
+            yield provider.chat(model, messages, options=opts)
+
+    def warm(self):
+        """Load the local chat model so the first answer is not a cold start.
+
+        A cold llama3.1:8b load costs about 20s here; doing it in a background
+        thread at startup keeps it out of the first question's latency.
+        """
+        results = []
+        try:
+            provider, model = self._pick(CHAT)
+        except ProviderError as e:
+            log.info("model warm-up skipped: %s", e)
+            return results
+        if not hasattr(provider, "chat_stream"):
+            return results
+        started = time.perf_counter()
+        try:
+            for _ in provider.chat_stream(model, [{"role": "user", "content": "hi"}],
+                                          options={"num_predict": 1, "think": False}):
+                break
+            seconds = time.perf_counter() - started
+            results.append({"model": model, "load_ms": round(seconds * 1000)})
+            log.info("model warm-up: %s ready in %.1fs", model, seconds)
+        except Exception as e:
+            log.warning("model warm-up failed for %s: %s", model, e)
+        return results
+
 
 _router = None
 
@@ -262,3 +356,9 @@ def get_router():
 def chat(messages, task_class=CHAT, options=None, json_mode=False):
     """Module-level convenience: route a chat call by task class."""
     return get_router().chat(messages, task_class=task_class, options=options, json_mode=json_mode)
+
+
+def chat_stream(messages, task_class=CHAT, options=None, json_mode=False):
+    """Module-level convenience: stream a routed chat call by task class."""
+    return get_router().chat_stream(messages, task_class=task_class,
+                                    options=options, json_mode=json_mode)

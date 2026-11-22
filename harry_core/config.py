@@ -49,6 +49,7 @@ DEFAULTS = {
             "type": "ollama",
             "url": "http://localhost:11434",
             "chat_model": "llama3.1:latest",    # non-thinking, fast, conversational
+            "fast_chat_model": "",              # opt-in smaller model for chat
             "reasoning_model": "qwen3:4b",      # thinking model for planning
             "routing_model": "llama3.1:latest", # fast classification
         },
@@ -59,6 +60,9 @@ DEFAULTS = {
             "model": "",
         },
         "vision_model": "",                # optional local vision model name
+        # Load the chat model in the background at startup so the first answer
+        # is not a cold model load (~20s on CPU).
+        "warm_on_start": True,
     },
     "voice": {
         "enabled": True,

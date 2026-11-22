@@ -234,6 +234,12 @@ def create_app():
         return Response(gen(), mimetype="text/event-stream",
                         headers={"Cache-Control": "no-cache"})
 
+    @app.get("/api/timing")
+    def timing_recent():
+        """Per-request stage timings recorded by harry_core.timing."""
+        from .timing import recent
+        return jsonify({"requests": recent(20)})
+
     @app.get("/api/state")
     def state():
         from .task_engine import get_engine
@@ -931,10 +937,43 @@ function finishPending(){
   setBusy(false);
 }
 
+/* Streamed text lands in one draft bubble per request and is replaced by the
+   final answer, so nothing is ever shown or counted twice. */
+const drafts = {};
+
+function onStream(piece, rid){
+  if (!piece) return;
+  if (pending && rid && pending.rid !== rid) return;
+  const key = rid || 'current';
+  let el = drafts[key];
+  if (!el){
+    if (pending && (!rid || pending.rid === rid)) finishPending();
+    el = document.createElement('div');
+    el.className = 'msg harry streaming';
+    log.appendChild(el);
+    drafts[key] = el;
+  }
+  el.textContent += piece;
+  log.scrollTop = log.scrollHeight;
+}
+
+function takeDraft(rid){
+  const key = rid || 'current';
+  const el = drafts[key] || null;
+  delete drafts[key];
+  return el;
+}
+
 function onAnswer(text, rid){
   const key = rid ? 'r:' + rid : null;
+  const draft = takeDraft(rid);
   if (pending && (!rid || pending.rid === rid)) finishPending();
-  if (text) addMsg('harry', text, key);
+  if (draft){
+    if (text) draft.textContent = text;
+    draft.className = 'msg harry';
+  } else if (text){
+    addMsg('harry', text, key);
+  }
   setTimeout(refreshState, 500);
   setTimeout(refreshState, 1800);
 }
@@ -1231,6 +1270,12 @@ es.addEventListener('assistant_message', function(e){
   let d = {};
   try { d = JSON.parse(e.data); } catch (_) {}
   onAnswer(d.text || '', d.request_id);
+});
+
+es.addEventListener('assistant_delta', function(e){
+  let d = {};
+  try { d = JSON.parse(e.data); } catch (_) {}
+  onStream(d.text || '', d.request_id);
 });
 
 es.addEventListener('user_message', function(e){
@@ -1919,6 +1964,31 @@ function addMsg(kind, text) {
   return d;
 }
 
+/* one draft bubble per streamed request, replaced by the final answer */
+const drafts = new Map();
+
+function onStream(piece, rid) {
+  if (!piece) return;
+  if (pendingRid && rid && rid !== pendingRid) return;
+  const key = rid || 'current';
+  let el = drafts.get(key);
+  if (!el) {
+    el = document.createElement('div');
+    el.className = 'msg harry streaming';
+    logEl.appendChild(el);
+    drafts.set(key, el);
+  }
+  el.textContent += piece;
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function takeDraft(rid) {
+  const key = rid || 'current';
+  const el = drafts.get(key) || null;
+  drafts.delete(key);
+  return el;
+}
+
 function send(text) {
   text = (text || '').trim();
   if (!text) return;
@@ -1953,13 +2023,23 @@ function onAssistant(data) {
   if (data.id && seen.has(data.id)) return;
   if (data.id) seen.add(data.id);
   if (pendingRid && data.request_id && data.request_id !== pendingRid) return;
-  addMsg('harry', data.text || '');
+  const draft = takeDraft(data.request_id);
+  if (draft) {
+    if (data.text) draft.textContent = data.text;
+    draft.className = 'msg harry';
+  } else {
+    addMsg('harry', data.text || '');
+  }
   pendingRid = null;
   setState('ready', 'ready');
 }
 
 const es = new EventSource('/api/stream');
 es.addEventListener('assistant_message', function(m){ onAssistant(JSON.parse(m.data)); });
+es.addEventListener('assistant_delta', function(m){
+  const d = JSON.parse(m.data);
+  onStream(d.text || '', d.request_id);
+});
 es.addEventListener('user_message', function(m){
   const d = JSON.parse(m.data);
   if (d.source === 'voice') addMsg('user', d.text + '  (voice)');

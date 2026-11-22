@@ -19,7 +19,7 @@ import threading
 import time
 import uuid
 
-from . import config, events, llm
+from . import config, events, llm, timing
 from .memory import get_memory
 from .tools import get_registry
 
@@ -175,11 +175,12 @@ class TaskEngine:
             r"\b(reply|respond|say|answer|tell me|repeat|translate)\b",
             text, re.IGNORECASE))
 
-        # Unambiguous question ("what/how/why ..." with no action cue): answer
-        # it directly instead of paying for a routing-model round-trip.
-        # Ambiguous requests (both question and action cues) still go to the
-        # model, so classification accuracy is preserved.
-        if rule_question and not rule_task and not rule_chat_instruction:
+        # No action cue at all means there is nothing to DO, so it is a
+        # question. The routing model would only confirm what the rules already
+        # know, and on CPU that extra round-trip costs 5-15s before the answer
+        # even starts. Only genuinely ambiguous requests (an action verb plus a
+        # question word) still pay for model classification.
+        if not rule_task:
             log.debug("classify rule: question (%s)", text[:60])
             return "question", text
 
@@ -295,8 +296,12 @@ Memory context: {self._memory_context(task.title)}"""
 
     # -- execution ------------------------------------------------------------
 
-    def run_task(self, task_id):
-        """Execute a task through the full lifecycle. Returns the task dict."""
+    def run_task(self, task_id, on_delta=None):
+        """Execute a task through the full lifecycle. Returns the task dict.
+
+        ``on_delta`` receives each answer fragment as the model writes it, so
+        callers can stream text (and start speech) before the answer is done.
+        """
         task = self.tasks.get(task_id)
         if not task:
             return {"ok": False, "error": f"unknown task {task_id}"}
@@ -311,7 +316,8 @@ Memory context: {self._memory_context(task.title)}"""
         if task.status in (NEW, ERROR, ANALYZING_ERROR):
             self.update_status(task, UNDERSTANDING)
             t0 = time.perf_counter()
-            kind, goal = self.classify_request(task.title)
+            with timing.stage("classify"):
+                kind, goal = self.classify_request(task.title)
             stage("classify", t0)
             task.kind = kind
             # task.title keeps the EXACT original request (filenames, content,
@@ -337,7 +343,7 @@ Memory context: {self._memory_context(task.title)}"""
         try:
             if task.kind == "question":
                 t0 = time.perf_counter()
-                task.answer = self._answer_question(task)
+                task.answer = self._answer_question(task, on_delta=on_delta)
                 stage("answer", t0)
             else:
                 self._execute_steps(task)
@@ -598,19 +604,22 @@ Respond JSON: {{"analysis": "...", "strategy": "retry" | "alternative",
 
     # -- Q&A path (fast, no planning) --------------------------------------------
 
-    def _answer_question(self, task):
-        from .agents import prompt_for, select_agent
+    def _answer_question(self, task, on_delta=None):
+        from .agents import select_agent
         from .language_policy import instruction as language_instruction
         from . import config
         agent = select_agent(task.title)
         lang_rule = language_instruction(
             task.title, config.CONFIG.get("language", {}).get("preference", "auto")
         )
-        memory_hits = self._memory_context(task.title)
-        convo = get_memory().conversation.recent(8)
+        with timing.stage("memory"):
+            memory_hits = self._memory_context(task.title)
+            convo = get_memory().conversation.recent(8)
         messages = [{
             "role": "system",
-            "content": prompt_for(agent) + " " + lang_rule + (
+            # The specialist's own prompt only: the coordination note applies to
+            # task execution and is dead weight on a plain question.
+            "content": agent.system_prompt + " " + lang_rule + (
                 " When the user gives an exact instruction, comply literally. "
                 "Never invent facts."
             ),
@@ -636,12 +645,27 @@ Respond JSON: {{"analysis": "...", "strategy": "retry" | "alternative",
                 messages.append({"role": "assistant", "content": reply_text})
         messages.append({"role": "user", "content": task.title})
 
+        parts = []
         try:
-            answer = llm.chat(messages, task_class=agent.task_class,
-                              options={"num_predict": 200})
+            # Stream: the first words reach the user in ~1s instead of after
+            # the whole (CPU-bound) generation finishes.
+            for piece in llm.chat_stream(messages, task_class=agent.task_class,
+                                         options={"num_predict": 200}):
+                parts.append(piece)
+                if on_delta is not None:
+                    on_delta(piece)
+            answer = "".join(parts).strip()
+            if not answer:
+                raise llm.ProviderError("empty response from the model")
         except Exception as e:
-            answer = (f"I could not reach the AI model right now ({e}). "
-                      "Check that Ollama is running or configure an online model.")
+            if parts:
+                # Keep what was already delivered; do not replace it with an
+                # error after the user has started reading.
+                answer = "".join(parts).strip()
+                log.warning("answer stream ended early: %s", e)
+            else:
+                answer = (f"I could not reach the AI model right now ({e}). "
+                          "Check that Ollama is running or configure an online model.")
         task.result = answer
         # Conversation history is recorded by Brain.handle_input (one user turn,
         # one assistant turn per request) so every path behaves identically and
