@@ -377,10 +377,15 @@ def safe_download(url, max_bytes, allow_local=False, timeout=180):
 def _load_diffusers(model_id):
     import torch
     from diffusers import StableDiffusionPipeline
-    pipe = StableDiffusionPipeline.from_pretrained(
-        model_id, torch_dtype=torch.float32,
-        safety_checker=None, requires_safety_checker=False,
-    )
+    kwargs = dict(torch_dtype=torch.float32, safety_checker=None,
+                  requires_safety_checker=False)
+    try:
+        pipe = StableDiffusionPipeline.from_pretrained(model_id, **kwargs)
+    except (OSError, ValueError):
+        # Some checkpoints ship only the fp16 variant; the weights are loaded
+        # and cast to float32, which is what CPU inference needs.
+        kwargs["variant"] = "fp16"
+        pipe = StableDiffusionPipeline.from_pretrained(model_id, **kwargs)
     pipe = pipe.to("cpu")
     try:
         pipe.enable_attention_slicing()

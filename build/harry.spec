@@ -48,6 +48,11 @@ hiddenimports.append("harry_build_info")
 excludes = [
     "torch", "torchvision", "torchaudio", "resemblyzer", "scipy", "soundfile",
     "matplotlib", "pandas", "pytest", "PyInstaller", "faulthandler", "tkinter",
+    # In-process diffusion is a server/development provider. The Windows app
+    # talks to a local A1111/ComfyUI server or a hosted API instead, so the
+    # torch-backed training stack must never enter the installer.
+    "diffusers", "transformers", "accelerate", "safetensors", "huggingface_hub",
+    "tokenizers", "triton", "xformers",
 ]
 
 datas = [

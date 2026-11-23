@@ -160,43 +160,61 @@ class TaskEngine:
     def classify_request(self, text):
         """Decide if the user wants an ANSWER (question) or an ACTION (task).
 
-        Uses the fast routing model with a rule-based fallback, so it also
-        works fully offline.
+        Deterministic by design. A model call here used to cost 5-18s on CPU
+        before the answer even started, and it sometimes sent content requests
+        ("write a python function") into the file-mutating planner, which then
+        failed and told the user nothing.
+
+        Rule: a strong machine/world verb, or a weak creation verb together
+        with a file/format word, makes a task. Everything else is answered in
+        chat, including code and prose requests.
         """
-        rule_task = bool(re.search(
-            r"\b(fix|repair|create|build|make|write|install|open|close|delete|move|"
-            r"rename|organize|run|set ?up|configure|update|"
-            r"refactor|debug|deploy|download|clean|schedule|remind me to|"
-            r"remember to|add |remove )\b", text, re.IGNORECASE))
-        rule_question = bool(re.search(
-            r"\b(what|why|who|when|where|which|how|is|are|does|do|can you tell|"
-            r"explain|define|mean|kavali|enti|emiti|kya|kaun)\b", text, re.IGNORECASE))
-        rule_chat_instruction = bool(re.search(
+        text = str(text or "")
+        chat_instruction = bool(re.search(
             r"\b(reply|respond|say|answer|tell me|repeat|translate)\b",
             text, re.IGNORECASE))
-
-        # No action cue at all means there is nothing to DO, so it is a
-        # question. The routing model would only confirm what the rules already
-        # know, and on CPU that extra round-trip costs 5-15s before the answer
-        # even starts. Only genuinely ambiguous requests (an action verb plus a
-        # question word) still pay for model classification.
-        if not rule_task:
-            log.debug("classify rule: question (%s)", text[:60])
+        strong = bool(re.search(
+            r"\b(run|execute|install|uninstall|delete|remove|move|rename|copy|"
+            r"organize|open|close|download|upload|deploy|commit|push|send|email|"
+            r"schedule|remind me|screenshot|fix|repair|debug|refactor|configure|"
+            r"set ?up|update|clean|convert|extract|compress|zip|unzip|print)\b",
+            text, re.IGNORECASE))
+        weak = bool(re.search(
+            r"\b(create|make|write|generate|build|add|export|save|draft)\b",
+            text, re.IGNORECASE))
+        file_hint = bool(re.search(
+            r"\.(txt|md|pdf|docx|xlsx|pptx|csv|json|py|html)\b|"
+            r"\b(file|folder|directory|spreadsheet|presentation|slides?|"
+            r"report|invoice|resume|document)\b",
+            text, re.IGNORECASE))
+        if chat_instruction and not (strong or (weak and file_hint)):
             return "question", text
+        if strong or (weak and file_hint):
+            log.debug("classify: task (%s)", text[:60])
+            return "task", text
+        log.debug("classify: question (%s)", text[:60])
+        return "question", text
 
+    def _classify_with_model(self, text):
+        """Optional model classification, kept for experiments only.
+
+        Enable with HARRY_CLASSIFY_MODEL=1. Not used by default: the rules
+        above are faster and did not produce better outcomes in testing.
+        """
+
+        import os as _os
+        if str(_os.environ.get("HARRY_CLASSIFY_MODEL", "")).lower() not in ("1", "true", "yes"):
+            return self.classify_request(text)
         prompt = (
             "Classify what the user wants. Answer with JSON only:\n"
             '{"type": "question" | "task", "goal": "<short restated goal>"}\n\n'
-            '"question" = user wants information, an answer, or conversation '
-            "(includes requests to reply/say/answer something).\n"
-            '"task" = user wants something done or changed on the computer or '
-            "in the world (files, apps, code, web, system).\n\n"
+            '"question" = the user wants information, an explanation or content\n'
+            '"task" = the user wants something changed on the computer or in the world\n\n'
             "Examples:\n"
             'fix my portfolio gallery -> {"type": "task"}\n'
             'what is python used for -> {"type": "question"}\n'
-            'Reply with exactly: OK -> {"type": "question"}\n'
+            'write a python function to reverse a string -> {"type": "question"}\n'
             'create a file called notes.txt -> {"type": "task"}\n'
-            'na portfolio open chesi error check cheyyi -> {"type": "task"}\n'
             'ela unnav? -> {"type": "question"}\n\n'
             f"User request: {text}"
         )
@@ -213,18 +231,9 @@ class TaskEngine:
             kind = data.get("type", "question")
             if kind not in ("question", "task"):
                 kind = "question"
-            # A chat instruction ("reply with...", "say...", "translate...")
-            # with no real action words is never a computer task, whichever way
-            # the routing model leaned (it occasionally misroutes these,
-            # sending harmless requests through the whole planner).
-            if rule_chat_instruction and not rule_task:
-                kind = "question"
             return kind, data.get("goal", text)
         except Exception:
-            # offline / model failure fallback
-            if rule_task and not rule_question and not rule_chat_instruction:
-                return "task", text
-            return "question", text
+            return self.classify_request(text)
 
     # -- planning ------------------------------------------------------------
 

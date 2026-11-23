@@ -22,9 +22,13 @@ import logging
 import os
 import re
 import time
+import urllib.error
 import urllib.request
 
 from . import config, timing
+
+# model -> (timestamp, capabilities); avoids a /api/show call per turn
+_CAPS_CACHE = {}
 
 log = logging.getLogger("harry.llm")
 
@@ -59,6 +63,34 @@ class OllamaProvider:
         models = self.available()
         return any(m == name or m.split(":")[0] == name.split(":")[0] for m in models)
 
+    def _capabilities(self, model):
+        """Capabilities reported by Ollama, cached.
+
+        Sending ``think`` to a model that does not support it makes Ollama
+        answer 400 and the whole turn fails, so this has to be checked rather
+        than assumed.
+        """
+        now = time.time()
+        cached = _CAPS_CACHE.get(model)
+        if cached and now - cached[0] < 300:
+            return cached[1]
+        caps = []
+        try:
+            req = urllib.request.Request(
+                self.url + "/api/show",
+                data=json.dumps({"model": model}).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as r:
+                caps = json.loads(r.read().decode()).get("capabilities") or []
+        except Exception:
+            caps = []
+        _CAPS_CACHE[model] = (now, caps)
+        return caps
+
+    def supports_thinking(self, model):
+        return "thinking" in self._capabilities(model)
+
     def _payload(self, model, messages, options=None, json_mode=False,
                  stream=False):
         payload = {
@@ -70,15 +102,19 @@ class OllamaProvider:
             "keep_alive": "30m",
         }
         opts = dict(options or {})
-        # "think" is a provider directive, not a model option
-        if "think" in opts:
-            payload["think"] = bool(opts.pop("think"))
+        # "think" is a provider directive, not a model option. Only send it
+        # when this model actually supports thinking: Ollama rejects the field
+        # for everything else (e.g. qwen2.5-coder).
+        think = opts.pop("think", None)
+        thinking_model = self.supports_thinking(model)
+        if thinking_model and think is not None:
+            payload["think"] = bool(think)
         if json_mode:
             payload["format"] = "json"
-            # Thinking models (e.g. qwen3) burn the entire token budget on the
-            # hidden 'thinking' field before emitting JSON. Disable thinking
-            # natively and give the call headroom.
-            payload["think"] = False
+            if thinking_model:
+                payload["think"] = False
+            # Thinking models burn the whole token budget in the hidden field
+            # before emitting JSON, so give every JSON call some headroom.
             opts.setdefault("num_predict", 600)
         if opts:
             payload["options"] = opts
@@ -90,7 +126,17 @@ class OllamaProvider:
             data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json"},
         )
-        return urllib.request.urlopen(req, timeout=300)
+        try:
+            return urllib.request.urlopen(req, timeout=300)
+        except urllib.error.HTTPError as e:
+            # "HTTP Error 400" alone hides the actual cause (an unknown option,
+            # a context overflow, a model without vision). Keep the body.
+            detail = ""
+            try:
+                detail = e.read().decode("utf-8", "replace")[:500]
+            except Exception:
+                pass
+            raise ProviderError(f"Ollama rejected the request ({e.code}): {detail or e.reason}")
 
     def chat(self, model, messages, options=None, json_mode=False, _retry=0):
         started = time.perf_counter()
@@ -267,6 +313,19 @@ class ModelRouter:
             "an online provider in config.json."
         )
 
+    def _fallback(self, model):
+        """The configured chat model, when it differs from the one that failed."""
+        name = str((config.CONFIG.get("models", {}).get("local", {}) or {})
+                   .get("chat_model") or "")
+        if not name or name == model:
+            return None
+        try:
+            if not self.local.has_model(name):
+                return None
+        except Exception:
+            return None
+        return self.local, name
+
     # -- main entry --------------------------------------------------------
 
     def chat(self, messages, task_class=CHAT, options=None, json_mode=False):
@@ -279,11 +338,22 @@ class ModelRouter:
         opts = dict(options or {})
         opts.setdefault("think", task_class in (REASONING, CODING))
         provider, model = self._pick(task_class, json_mode)
+        tried = {model}
         last_err = None
-        for attempt in range(2):
+        for attempt in range(3):
             try:
                 return provider.chat(model, messages, options=opts, json_mode=json_mode)
-            except ProviderError:
+            except ProviderError as e:
+                # One model refusing a request (no thinking support, missing
+                # context, unloaded weights) must not end the turn when the
+                # configured chat model can answer instead.
+                fallback = self._fallback(model)
+                if fallback and fallback[1] not in tried:
+                    tried.add(fallback[1])
+                    log.warning("model %s failed (%s); retrying with %s",
+                                model, e, fallback[1])
+                    provider, model = fallback
+                    continue
                 raise
             except Exception as e:  # transient network/model errors: retry once
                 last_err = e
@@ -313,6 +383,12 @@ class ModelRouter:
                 # Text is already on screen; a second full answer would be
                 # worse than reporting the interruption.
                 raise ProviderError(f"stream interrupted: {e}")
+            fallback = self._fallback(model)
+            if fallback and fallback[1] != model:
+                log.warning("model %s could not stream (%s); using %s",
+                            model, e, fallback[1])
+                provider, model = fallback
+                timing.set_model(model)
             log.warning("streaming unavailable (%s); using a blocking call", e)
             yield provider.chat(model, messages, options=opts)
 
