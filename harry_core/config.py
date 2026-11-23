@@ -97,6 +97,34 @@ DEFAULTS = {
         "verify_threshold": 0.43,
         "voice_profile_path": "hareesh_voice_profile.pkl",
     },
+    "media": {
+        # Image and video generation (harry_core/media.py). ``auto`` uses the
+        # first ready local provider; nothing is generated without one.
+        "image": {
+            "provider": "auto",           # auto | diffusers | automatic1111 | comfyui | openai
+            "diffusers_model": "data/models/sd-turbo",
+            "size": 512,                   # 512 | 768 | 1024
+            "steps": 4,                    # sd-turbo needs very few steps
+            "automatic1111_url": "http://127.0.0.1:7860",
+            "comfyui_url": "http://127.0.0.1:8188",
+            "comfyui_workflow": "",        # JSON template with {{PROMPT}} and {{SEED}}
+            "openai_url": "https://api.openai.com/v1",
+            "openai_api_key_env": "OPENAI_API_KEY",
+            "openai_model": "",           # e.g. gpt-image-1 (paid, needs a key)
+        },
+        "video": {
+            "provider": "auto",           # auto | replicate | fal | comfyui
+            "replicate_url": "https://api.replicate.com/v1",
+            "replicate_api_key_env": "REPLICATE_API_TOKEN",
+            "replicate_version": "",       # a model version id from Replicate
+            "fal_url": "https://fal.run",
+            "fal_api_key_env": "FAL_KEY",
+            "fal_model": "",               # e.g. fal-ai/ltx-video
+            "comfyui_url": "http://127.0.0.1:8188",
+            "comfyui_workflow": "",
+            "max_seconds": 10,
+        },
+    },
     "language": {
         # auto follows the product policy: mixed Telugu-English for general
         # conversation and English for task/technical responses.

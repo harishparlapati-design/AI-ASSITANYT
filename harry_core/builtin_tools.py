@@ -588,7 +588,9 @@ def register_builtins(registry):
     from .research import register_research_tools
     from .documents import register_document_tools
     from .docgen import register_document_generation_tools
+    from .media import register_media_tools
     register_math_tools(registry)
     register_research_tools(registry)
     register_document_tools(registry)
     register_document_generation_tools(registry)
+    register_media_tools(registry)

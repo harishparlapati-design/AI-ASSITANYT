@@ -610,6 +610,127 @@ def create_app():
         result, status_code = get_screen().accept_frame(image, question=question or None)
         return jsonify(result), status_code
 
+    # ---------------- generated media ----------------
+
+    import re as _re
+    _MEDIA_ID = _re.compile(r"^(?:image|video)_[A-Za-z0-9_]{6,64}$")
+
+    @app.get("/api/media")
+    def media_index():
+        from .media import listing, status as media_status
+        kind = request.args.get("kind") or None
+        if kind not in (None, "image", "video"):
+            return jsonify({"error": "kind must be image or video"}), 400
+        items = [{k: item[k] for k in ("id", "kind", "name", "bytes", "mime",
+                                       "prompt", "created", "meta")}
+                 for item in listing(kind=kind, limit=40)]
+        return jsonify({"providers": media_status(), "items": items})
+
+    def _media_spec(payload):
+        prompt = str(payload.get("prompt") or "").strip()
+        if not prompt:
+            raise ValueError("a prompt is required")
+        if len(prompt) > 2000:
+            raise ValueError("prompts are limited to 2000 characters")
+        return prompt
+
+    @app.post("/api/media/image")
+    def media_image():
+        from .jobs import get_jobs
+        from .media import MAX_IMAGE_BYTES, generate_image, status as media_status
+        payload = request.get_json(silent=True) or {}
+        try:
+            prompt = _media_spec(payload)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        state = media_status()["image"]
+        if not state["available"]:
+            return jsonify({"error": "no image provider is configured",
+                            "hint": state["hint"]}), 503
+        spec = {
+            "prompt": prompt,
+            "size": payload.get("size"), "steps": payload.get("steps"),
+            "seed": payload.get("seed"), "negative": payload.get("negative"),
+        }
+        job = get_jobs().submit(
+            "image", f"image · {prompt[:60]}",
+            lambda j: generate_image(j, spec),
+            meta={"kind": "image", "prompt": prompt,
+                  "max_bytes": MAX_IMAGE_BYTES})
+        return jsonify({"job": job}), 202
+
+    @app.post("/api/media/video")
+    def media_video():
+        from .jobs import get_jobs
+        from .media import generate_video, status as media_status
+        payload = request.get_json(silent=True) or {}
+        try:
+            prompt = _media_spec(payload)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        state = media_status()["video"]
+        if not state["available"]:
+            return jsonify({"error": "no video provider is configured",
+                            "hint": state["hint"]}), 503
+        spec = {"prompt": prompt, "seconds": payload.get("seconds"),
+                "aspect": payload.get("aspect")}
+        job = get_jobs().submit(
+            "video", f"video · {prompt[:60]}",
+            lambda j: generate_video(j, spec),
+            meta={"kind": "video", "prompt": prompt})
+        return jsonify({"job": job}), 202
+
+    @app.post("/api/media/<item_id>/regenerate")
+    def media_regenerate(item_id):
+        from .jobs import get_jobs
+        from . import media
+        if not _MEDIA_ID.match(str(item_id or "")):
+            return jsonify({"error": "invalid media id"}), 400
+        record = media.get(item_id)
+        if not record:
+            return jsonify({"error": "media not found"}), 404
+        state = media.status()[record["kind"]]
+        if not state["available"]:
+            return jsonify({"error": f"no {record['kind']} provider is configured",
+                            "hint": state["hint"]}), 503
+        meta = record.get("meta") or {}
+        spec = {"prompt": record["prompt"], "size": meta.get("size"),
+                "steps": meta.get("steps"), "negative": meta.get("negative")}
+        if record["kind"] == "video":
+            spec = {"prompt": record["prompt"],
+                    "seconds": meta.get("seconds"), "aspect": meta.get("aspect")}
+        runner = media.generate_video if record["kind"] == "video" else media.generate_image
+        job = get_jobs().submit(
+            record["kind"], f"regenerate · {record['prompt'][:50]}",
+            lambda j: runner(j, spec),
+            meta={"kind": record["kind"], "prompt": record["prompt"],
+                  "regenerated_from": record["id"]})
+        return jsonify({"job": job}), 202
+
+    @app.get("/api/media/<item_id>/file")
+    def media_file(item_id):
+        from flask import send_file
+        from . import media
+        if not _MEDIA_ID.match(str(item_id or "")):
+            return jsonify({"error": "invalid media id"}), 400
+        record = media.get(item_id)
+        if not record:
+            return jsonify({"error": "media not found"}), 404
+        response = send_file(record["path"], mimetype=record["mime"],
+                             as_attachment=False, conditional=True)
+        response.headers["Cache-Control"] = "private, max-age=0, must-revalidate"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Content-Security-Policy"] = "default-src 'none'; media-src 'self'"
+        return response
+
+    @app.post("/api/media/<item_id>/delete")
+    def media_delete(item_id):
+        from . import media
+        if not _MEDIA_ID.match(str(item_id or "")):
+            return jsonify({"error": "invalid media id"}), 400
+        result = media.delete(item_id)
+        return jsonify(result), (200 if result.get("ok") else 404)
+
     # ---------------- background jobs (documents, media) ----------------
 
     @app.get("/api/jobs")
@@ -895,7 +1016,17 @@ _INDEX_HTML = """<!doctype html>
   .doc-row .helper { white-space:nowrap; }
   .doc-preview { margin:8px 0 0;max-height:230px;overflow:auto;padding:10px;border:1px solid var(--line);border-radius:10px;background:var(--input);font:11px/1.5 ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-word;color:var(--tx); }
   .job-track { height:5px;border-radius:3px;background:var(--surface-soft);overflow:hidden;margin-top:8px; }
-  #docJobBar { height:100%;width:0;background:linear-gradient(90deg,var(--acc),var(--ok));transition:width .3s; }
+  #docJobBar, #mediaJobBar { height:100%;width:0;background:linear-gradient(90deg,var(--acc),var(--ok));transition:width .3s; }
+  .media-tabs { display:flex;gap:6px;margin-bottom:8px; }
+  .media-tabs .tab { background:var(--surface-soft);color:var(--dim);border:1px solid var(--line);padding:6px 12px;font-size:11px; }
+  .media-tabs .tab.active { background:var(--acc-strong);color:#fff;border-color:transparent; }
+  .media-grid { display:grid;grid-template-columns:repeat(auto-fill,minmax(142px,1fr));gap:8px;max-height:320px;overflow:auto; }
+  .media-card { border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--surface-soft);display:flex;flex-direction:column;min-width:0; }
+  .media-card img,.media-card video { width:100%;height:112px;object-fit:cover;background:#000;display:block; }
+  .media-card .media-actions { display:flex;gap:4px;padding:5px;flex-wrap:wrap; }
+  .media-card .media-actions a,.media-card .media-actions button { font-size:10px;padding:4px 7px;border-radius:7px;font-weight:600;text-decoration:none; }
+  .media-card .media-actions a { background:var(--acc-strong);color:#fff; }
+  .media-card .media-prompt { font-size:10px;padding:0 6px 6px;color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
   .detail-panel { padding:16px;min-width:0; }
   .detail-panel > p { margin:-4px 0 12px;color:var(--dim);font-size:11px; }
   .section-title { display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px; }
@@ -1122,6 +1253,43 @@ _INDEX_HTML = """<!doctype html>
       <div class="create-output">
         <div id="docList" class="doc-list"><div class="info-card">No generated documents yet.</div></div>
         <pre id="docPreview" class="doc-preview" hidden></pre>
+      </div>
+    </div>
+  </section>
+  <section class="panel detail-panel create-panel">
+    <div class="section-title"><h2>Generate images &amp; video</h2><button id="mediaRefresh" class="ghost small-btn">Refresh</button></div>
+    <p id="mediaProviders" class="helper">Checking generation providers…</p>
+    <div class="create-grid">
+      <div class="create-controls">
+        <div class="media-tabs" role="tablist">
+          <button id="tabImage" class="tab active" type="button" role="tab" aria-selected="true">Image</button>
+          <button id="tabVideo" class="tab" type="button" role="tab" aria-selected="false">Video</button>
+        </div>
+        <textarea id="mediaPrompt" maxlength="2000" placeholder="Describe the image to generate…"></textarea>
+        <div class="inline-form" id="imageControls">
+          <select id="mediaSize" aria-label="Image size">
+            <option value="512">512 × 512</option><option value="768">768 × 768</option><option value="1024">1024 × 1024</option>
+          </select>
+          <input id="mediaSeed" type="text" inputmode="numeric" placeholder="Seed (optional)">
+        </div>
+        <div class="inline-form" id="videoControls" hidden>
+          <select id="mediaSeconds" aria-label="Video duration">
+            <option value="2">2 seconds</option><option value="4" selected>4 seconds</option>
+            <option value="6">6 seconds</option><option value="8">8 seconds</option><option value="10">10 seconds</option>
+          </select>
+          <select id="mediaAspect" aria-label="Aspect ratio">
+            <option value="16:9">16:9</option><option value="9:16">9:16</option><option value="1:1">1:1</option>
+          </select>
+        </div>
+        <div class="inline-form">
+          <button id="mediaGenerate">Generate</button>
+          <button id="mediaCancel" class="ghost" disabled>Cancel</button>
+        </div>
+        <div id="mediaStatus" class="helper" role="status" aria-live="polite"></div>
+        <div id="mediaJob" class="job-track" hidden><div id="mediaJobBar"></div></div>
+      </div>
+      <div class="create-output">
+        <div id="mediaList" class="media-grid"><div class="info-card">No generated media yet.</div></div>
       </div>
     </div>
   </section>
@@ -2393,6 +2561,177 @@ es.addEventListener('document_ready', function(e){
   if (d && d.name) sys('document ready: ' + d.name);
 });
 refreshDocuments();
+
+/* ---------------- image and video generation ---------------- */
+let mediaKind = 'image', mediaJobId = null, mediaTimer = null;
+
+function setMediaKind(kind){
+  mediaKind = kind;
+  const imageTab = document.getElementById('tabImage');
+  const videoTab = document.getElementById('tabVideo');
+  imageTab.classList.toggle('active', kind === 'image');
+  videoTab.classList.toggle('active', kind === 'video');
+  imageTab.setAttribute('aria-selected', kind === 'image' ? 'true' : 'false');
+  videoTab.setAttribute('aria-selected', kind === 'video' ? 'true' : 'false');
+  document.getElementById('imageControls').hidden = kind !== 'image';
+  document.getElementById('videoControls').hidden = kind !== 'video';
+  document.getElementById('mediaPrompt').placeholder = kind === 'image'
+    ? 'Describe the image to generate…' : 'Describe the video to generate…';
+}
+
+function endMediaJob(){
+  if (mediaTimer){ clearTimeout(mediaTimer); mediaTimer = null; }
+  mediaJobId = null;
+  document.getElementById('mediaGenerate').disabled = false;
+  document.getElementById('mediaCancel').disabled = true;
+}
+
+async function refreshMedia(){
+  const list = document.getElementById('mediaList');
+  const providers = document.getElementById('mediaProviders');
+  try {
+    const data = await (await fetch('/api/media')).json();
+    const imageState = data.providers.image, videoState = data.providers.video;
+    providers.textContent = 'Images: ' + (imageState.available ? imageState.providers.join(', ') : 'not configured')
+      + ' · Video: ' + (videoState.available ? videoState.providers.join(', ') : 'not configured');
+    providers.title = imageState.hint || videoState.hint || '';
+    list.innerHTML = '';
+    if (!(data.items || []).length){
+      const empty = document.createElement('div');
+      empty.className = 'info-card';
+      empty.textContent = 'Nothing generated yet.';
+      list.appendChild(empty);
+      return;
+    }
+    data.items.forEach(function(item){
+      const card = document.createElement('div');
+      card.className = 'media-card';
+      const src = '/api/media/' + encodeURIComponent(item.id) + '/file';
+      if (item.kind === 'image'){
+        const img = document.createElement('img');
+        img.src = src; img.alt = item.prompt || 'generated image'; img.loading = 'lazy';
+        card.appendChild(img);
+      } else {
+        const video = document.createElement('video');
+        video.src = src; video.controls = true; video.muted = true; video.loop = true;
+        video.playsInline = true; video.preload = 'metadata';
+        card.appendChild(video);
+      }
+      const actions = document.createElement('div');
+      actions.className = 'media-actions';
+      const download = document.createElement('a');
+      download.href = src; download.download = item.name; download.textContent = 'Download';
+      const again = document.createElement('button');
+      again.className = 'ghost small-btn'; again.textContent = 'Regenerate';
+      again.addEventListener('click', function(){ regenerateMedia(item.id); });
+      const remove = document.createElement('button');
+      remove.className = 'danger small-btn'; remove.textContent = 'Delete';
+      remove.addEventListener('click', function(){ deleteMedia(item.id); });
+      actions.appendChild(download); actions.appendChild(again); actions.appendChild(remove);
+      card.appendChild(actions);
+      const prompt = document.createElement('div');
+      prompt.className = 'media-prompt'; prompt.textContent = item.prompt || '';
+      prompt.title = item.prompt || '';
+      card.appendChild(prompt);
+      list.appendChild(card);
+    });
+  } catch (e) {
+    providers.textContent = 'Could not read generation providers: ' + humanError(e);
+  }
+}
+
+async function pollMediaJob(){
+  const status = document.getElementById('mediaStatus');
+  const bar = document.getElementById('mediaJobBar');
+  if (!mediaJobId) return;
+  try {
+    const job = await (await fetch('/api/jobs/' + encodeURIComponent(mediaJobId))).json();
+    if (typeof job.state !== 'string') throw new Error(job.error || 'unknown job');
+    bar.style.width = (job.progress || 0) + '%';
+    status.textContent = (job.message || job.state) + ' · ' + (job.progress || 0) + '%';
+    if (job.state === 'done'){
+      status.textContent = 'Generated ' + (job.result && job.result.name ? job.result.name : 'media') + '.';
+      endMediaJob();
+      refreshMedia();
+    } else if (job.state === 'error' || job.state === 'cancelled'){
+      status.textContent = job.state === 'error'
+        ? 'Generation failed: ' + (job.error || 'unknown error') : 'Generation cancelled.';
+      endMediaJob();
+    } else {
+      mediaTimer = setTimeout(pollMediaJob, 900);
+    }
+  } catch (e) {
+    status.textContent = 'Lost track of the job: ' + humanError(e);
+    endMediaJob();
+  }
+}
+
+async function startMediaGeneration(){
+  const status = document.getElementById('mediaStatus');
+  const prompt = document.getElementById('mediaPrompt').value.trim();
+  if (!prompt){ status.textContent = 'Describe what to generate first.'; return; }
+  const payload = { prompt: prompt };
+  if (mediaKind === 'image'){
+    payload.size = Number(document.getElementById('mediaSize').value);
+    const seed = document.getElementById('mediaSeed').value.trim();
+    if (seed) payload.seed = Number(seed);
+  } else {
+    payload.seconds = Number(document.getElementById('mediaSeconds').value);
+    payload.aspect = document.getElementById('mediaAspect').value;
+  }
+  document.getElementById('mediaGenerate').disabled = true;
+  document.getElementById('mediaCancel').disabled = false;
+  document.getElementById('mediaJob').hidden = false;
+  document.getElementById('mediaJobBar').style.width = '0%';
+  status.textContent = 'Queueing…';
+  try {
+    const data = await postJSON('/api/media/' + mediaKind, payload);
+    mediaJobId = data.job.id;
+    pollMediaJob();
+  } catch (e) {
+    status.textContent = 'Could not start generation: ' + humanError(e);
+    endMediaJob();
+  }
+}
+
+async function regenerateMedia(id){
+  const status = document.getElementById('mediaStatus');
+  status.textContent = 'Queueing a fresh generation…';
+  try {
+    const data = await postJSON('/api/media/' + encodeURIComponent(id) + '/regenerate', {});
+    mediaJobId = data.job.id;
+    document.getElementById('mediaGenerate').disabled = true;
+    document.getElementById('mediaCancel').disabled = false;
+    document.getElementById('mediaJob').hidden = false;
+    pollMediaJob();
+  } catch (e) {
+    status.textContent = 'Could not regenerate: ' + humanError(e);
+  }
+}
+
+async function deleteMedia(id){
+  if (!window.confirm('Delete this generated file from disk?')) return;
+  try { await postJSON('/api/media/' + encodeURIComponent(id) + '/delete', {}); }
+  catch (e) { document.getElementById('mediaStatus').textContent = humanError(e); }
+  refreshMedia();
+}
+
+document.getElementById('tabImage').addEventListener('click', function(){ setMediaKind('image'); });
+document.getElementById('tabVideo').addEventListener('click', function(){ setMediaKind('video'); });
+document.getElementById('mediaGenerate').addEventListener('click', startMediaGeneration);
+document.getElementById('mediaRefresh').addEventListener('click', refreshMedia);
+document.getElementById('mediaCancel').addEventListener('click', async function(){
+  if (!mediaJobId) return;
+  this.disabled = true;
+  try { await postJSON('/api/jobs/' + encodeURIComponent(mediaJobId) + '/cancel', {}); }
+  catch (e) { sys('⚠ ' + humanError(e)); }
+});
+es.addEventListener('job_finished', function(e){
+  let d = {};
+  try { d = JSON.parse(e.data); } catch (_) {}
+  if (d && (d.kind === 'image' || d.kind === 'video')) refreshMedia();
+});
+refreshMedia();
 
 addMsg('sys', 'Harry ready. Type, or press 🎤 to talk. Voice and text share this conversation.');
 refreshState();
