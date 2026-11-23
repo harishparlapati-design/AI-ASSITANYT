@@ -18,6 +18,7 @@ Anything else is diagnosed and reported, never "fixed" by pretending.
 """
 
 import json
+import uuid
 import logging
 import os
 import time
@@ -76,7 +77,7 @@ def _save_history():
 
 
 def _record(entry):
-    entry = {"at": time.time(), **entry}
+    entry = {"id": uuid.uuid4().hex[:12], "at": time.time(), **entry}
     _load_history()
     with _thread_lock():
         _history.append(entry)
@@ -451,3 +452,13 @@ def alert(kind, message, detail=None):
 
 def recent(limit=50):
     return list(reversed(_load_history()[-int(limit):]))
+
+
+def entry(error_id):
+    """One history entry by id, or None when the id is unknown."""
+    if not str(error_id or "").strip():
+        return None
+    for item in reversed(_load_history()):
+        if str(item.get("id")) == str(error_id):
+            return item
+    return None

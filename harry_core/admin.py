@@ -108,7 +108,7 @@ class AdminStore:
     def is_admin(self, user_id):
         return self.role(user_id) == ROLE_ADMIN
 
-    def set_role(self, user_id, role):
+    def set_role(self, user_id, role, actor=None):
         if role not in (ROLE_ADMIN, ROLE_USER):
             return {"ok": False, "error": "unknown role"}
         with self._lock, self._connect() as db:
@@ -121,8 +121,15 @@ class AdminStore:
             if current["role"] == ROLE_ADMIN and role != ROLE_ADMIN and admins <= 1:
                 return {"ok": False, "error": "the last administrator cannot be demoted"}
             db.execute("UPDATE users SET role=? WHERE id=?", (role, str(user_id)))
-        self.audit(user_id, "role_changed", {"role": role})
-        return {"ok": True, "role": role}
+        demoted = current["role"] == ROLE_ADMIN and role != ROLE_ADMIN
+        revoked = 0
+        if demoted:
+            # Losing the role must invalidate every elevation the account holds,
+            # not just the browser that happened to ask.
+            revoked = self.revoke_user_sessions(user_id, actor=actor or user_id,
+                                                reason="account demoted")
+        self.audit(user_id, "role_changed", {"role": role, "sessions_revoked": revoked})
+        return {"ok": True, "role": role, "sessions_revoked": revoked}
 
     def admin_ids(self):
         with self._lock, self._connect() as db:
@@ -229,8 +236,23 @@ class AdminStore:
                 return None
             if user_id and row["user_id"] != user_id:
                 return None
-            db.execute("UPDATE admin_sessions SET last_seen=? WHERE token=?",
-                       (now, str(token)))
+            # The elevation is re-checked against the account on every request:
+            # a demoted or deactivated account cannot keep acting as admin.
+            account = db.execute("SELECT role, active FROM users WHERE id=?",
+                                 (row["user_id"],)).fetchone()
+            if (not account or account["role"] != ROLE_ADMIN
+                    or not account["active"]):
+                db.execute("UPDATE admin_sessions SET revoked=1 WHERE token=?",
+                           (str(token),))
+                revoked_now = True
+            else:
+                revoked_now = False
+                db.execute("UPDATE admin_sessions SET last_seen=? WHERE token=?",
+                           (now, str(token)))
+        if revoked_now:
+            self.audit(row["user_id"], "admin_session_revoked",
+                       {"reason": "role or account state changed"})
+            return None
         return {"user_id": row["user_id"], "token": row["token"],
                 "created": row["created"], "expires": row["expires"]}
 
@@ -239,6 +261,19 @@ class AdminStore:
             db.execute("UPDATE admin_sessions SET revoked=1 WHERE token=?", (str(token),))
         self.audit(actor, "admin_session_revoked", {"reason": reason})
         return {"ok": True}
+
+    def revoke_user_sessions(self, user_id, actor=None, reason="sessions revoked"):
+        """Revoke every live elevation belonging to one account."""
+        with self._lock, self._connect() as db:
+            rows = db.execute("SELECT token FROM admin_sessions WHERE user_id=? "
+                              "AND revoked=0", (str(user_id),)).fetchall()
+            for row in rows:
+                db.execute("UPDATE admin_sessions SET revoked=1 WHERE token=?",
+                           (row["token"],))
+        if rows:
+            self.audit(actor or user_id, "admin_sessions_revoked",
+                       {"user": str(user_id), "count": len(rows), "reason": reason})
+        return len(rows)
 
     def sessions(self, user_id=None):
         now = time.time()

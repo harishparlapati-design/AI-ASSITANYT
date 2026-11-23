@@ -95,13 +95,17 @@ class AccountStore:
         user_id = "u_" + uuid.uuid4().hex[:12]
         try:
             with self._lock, self._connect() as db:
-                # The first account owns the instance; later accounts are users.
+                # BEGIN IMMEDIATE takes the write lock before the count, so two
+                # simultaneous first-run setups cannot both see an empty table
+                # and both become administrator.
+                db.execute("BEGIN IMMEDIATE")
                 existing = db.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
                 role = "admin" if not existing else "user"
                 db.execute("INSERT INTO users (id, email, name, salt, hash, created, role) "
                            "VALUES (?,?,?,?,?,?,?)",
                            (user_id, email, str(name or "").strip()[:80],
                             salt, self._hash(password, salt), time.time(), role))
+                db.commit()
         except sqlite3.IntegrityError:
             return {"ok": False, "error": "that email is already registered"}
         log.info("account created: %s (%s)", user_id, role)
@@ -134,6 +138,18 @@ class AccountStore:
     def delete(self, user_id):
         with self._lock, self._connect() as db:
             db.execute("DELETE FROM users WHERE id=?", (str(user_id),))
+        return {"ok": True}
+
+    def set_active(self, user_id, active):
+        with self._lock, self._connect() as db:
+            db.execute("UPDATE users SET active=? WHERE id=?",
+                       (1 if active else 0, str(user_id)))
+        return {"ok": True}
+
+    def rename(self, user_id, name):
+        with self._lock, self._connect() as db:
+            db.execute("UPDATE users SET name=? WHERE id=?",
+                       (str(name or "").strip()[:80], str(user_id)))
         return {"ok": True}
 
     # -- login -------------------------------------------------------------

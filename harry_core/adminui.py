@@ -13,6 +13,7 @@ import functools
 import json
 import logging
 import os
+import re
 import secrets
 import time
 
@@ -476,12 +477,95 @@ checkSession();
 
 # ------------------------------------------------------------------ helpers
 
+LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
+FORWARDED_HEADERS = ("X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto",
+                     "X-Forwarded-Port", "Forwarded", "X-Real-IP",
+                     "CF-Connecting-IP", "True-Client-IP")
+
+
+def _is_loopback_ip(value):
+    value = str(value or "").strip()
+    return value.startswith("127.") or value in ("::1", "0:0:0:0:0:0:0:1")
+
+
+def _host_name(host):
+    """Lower-case host without its port, keeping IPv6 brackets."""
+    host = str(host or "").strip().lower()
+    if host.startswith("["):
+        return host.split("]")[0] + "]"
+    return host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+
+
+def _trusted_proxies():
+    raw = os.environ.get("HARRY_TRUSTED_PROXIES", "") or ""
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
+
 def _client_ip():
     from flask import request
     forwarded = request.headers.get("X-Forwarded-For", "")
-    if forwarded:
-        return forwarded.split(",")[0].strip()[:60]
+    proxies = _trusted_proxies()
+    if forwarded and proxies and (request.remote_addr or "") in proxies:
+        # Only a hop we explicitly configured may supply the client address.
+        hop = forwarded.split(",")[-1].strip()
+        return hop[:60]
     return (request.remote_addr or "")[:60]
+
+
+def bootstrap_request_allowed():
+    """First-run setup is direct loopback only: (allowed, reason).
+
+    A proxy in front of Harry would make ``remote_addr`` look local, so any
+    forwarded header is refused outright rather than interpreted. Trusting one
+    requires an explicit operator decision that does not exist for setup.
+    """
+    from flask import request
+    present = [name for name in FORWARDED_HEADERS if request.headers.get(name)]
+    if present:
+        return False, ("first-run setup must reach Harry directly; forwarded "
+                       "headers are not trusted")
+    if not _is_loopback_ip(request.remote_addr):
+        return False, "first-run setup is only allowed from this computer"
+    if _host_name(request.host) not in LOOPBACK_HOSTS:
+        return False, "first-run setup requires a loopback Host header"
+    origin = (request.headers.get("Origin") or "").strip()
+    if origin:
+        from urllib.parse import urlparse
+        parsed = urlparse(origin)
+        if (parsed.scheme not in ("http", "https")
+                or parsed.netloc.lower() != str(request.host or "").lower()):
+            return False, "cross-origin first-run setup is refused"
+    site = (request.headers.get("Sec-Fetch-Site") or "").strip().lower()
+    if site and site not in ("same-origin", "none"):
+        return False, "cross-site first-run setup is refused"
+    return True, ""
+
+
+def _scrub_text(value):
+    """Remove secrets and local absolute paths before showing an error."""
+    from . import logging_setup
+    text = logging_setup.scrub(str(value))
+    try:
+        from . import runtime_paths
+        root = runtime_paths.workspace_root()
+        if root:
+            text = text.replace(root, "<app>")
+            text = text.replace(root.replace("\\", "/"), "<app>")
+    except Exception:
+        pass
+    return text
+
+
+def _scrub_tree(value, depth=0):
+    if depth > 6:
+        return "<truncated>"
+    if isinstance(value, dict):
+        return {str(k): _scrub_tree(v, depth + 1) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_scrub_tree(v, depth + 1) for v in value[:40]]
+    if isinstance(value, str):
+        return _scrub_text(value)[:2000]
+    return value
 
 
 def _session_token():
@@ -699,20 +783,25 @@ def install(app):
 
     @app.post("/api/admin/bootstrap")
     def admin_bootstrap():
-        """Create the very first administrator. Loopback only, zero accounts only."""
+        """Create the very first administrator. Direct loopback only."""
         from .accounts import get_store
-        from flask import request as _req
         if _hosted():
             return jsonify({"error": "create accounts from the operator CLI on hosted Harry"}), 403
-        if not (request.remote_addr or "").startswith("127.") and request.remote_addr != "::1":
-            return jsonify({"error": "first-run setup is only allowed from this computer"}), 403
-        store = get_store()
-        if store.count() != 0:
-            return jsonify({"error": "an account already exists"}), 409
+        allowed, reason = bootstrap_request_allowed()
+        if not allowed:
+            admin.get_admin_store().audit(None, "bootstrap_refused",
+                                          {"reason": reason}, _client_ip())
+            return jsonify({"error": reason}), 403
         body = request.get_json(silent=True) or {}
-        created = store.create(body.get("email", ""), body.get("password", ""))
+        created = get_store().create(body.get("email", ""), body.get("password", ""))
         if not created.get("ok"):
-            return jsonify({"error": created.get("error", "could not create the account")}), 400
+            error = created.get("error", "could not create the account")
+            return jsonify({"error": error}), (409 if "already registered" in error else 400)
+        if created.get("role") != admin.ROLE_ADMIN:
+            # A concurrent request created the administrator first; this account
+            # must not exist as a half-finished leftover.
+            get_store().delete(created["id"])
+            return jsonify({"error": "an account already exists"}), 409
         admin.get_admin_store().audit(created.get("id"), "admin_bootstrapped",
                                       {"email": created.get("email")}, _client_ip())
         return jsonify({"ok": True, "email": created.get("email"),
@@ -926,6 +1015,10 @@ def install(app):
         info = admin.request_admin()
         body = request.get_json(silent=True) or {}
         role = str(body.get("role") or "")
+        if role not in (admin.ROLE_ADMIN, admin.ROLE_USER):
+            return jsonify({"error": "role must be 'admin' or 'user'"}), 400
+        if not admin.get_admin_store().role(user_id):
+            return jsonify({"error": "unknown account"}), 404
         approval_id = str(body.get("approval_id") or "")
         store = admin.get_admin_store()
         match = {"user_id": user_id, "role": role}
@@ -941,13 +1034,19 @@ def install(app):
                 note="role change needs a recorded approval")
             return jsonify({"error": "this change needs an approval record",
                             "approval": pending.get("id"), "status": "pending"}), 202
-        result = store.set_role(user_id, role)
+        result = store.set_role(user_id, role, actor=info["user_id"])
         if not result.get("ok"):
             return jsonify({"error": result.get("error")}), 400
         store.consume_approval(record["id"], actor=info["user_id"])
         store.audit(info["user_id"], "role_changed",
                     {"user": user_id, "role": role, "approval": record["id"]})
         return jsonify(result)
+
+    def _user_row(row, admin_store):
+        return {"id": row["id"], "email": row["email"], "name": row["name"],
+                "created": row["created"], "active": bool(row["active"]),
+                "role": row["role"] or "user",
+                "administrator": admin_store.is_admin(row["id"])}
 
     @app.get("/api/admin/users")
     @admin_required
@@ -958,20 +1057,172 @@ def install(app):
         with store._connect() as db:
             rows = db.execute("SELECT id, email, name, created, active, role "
                               "FROM users ORDER BY created").fetchall()
-        return jsonify({"items": [
-            {"id": row["id"], "email": row["email"], "name": row["name"],
-             "created": row["created"], "active": bool(row["active"]),
-             "role": row["role"] or "user",
-             "administrator": admin_store.is_admin(row["id"])}
-            for row in rows]})
+        return jsonify({"items": [_user_row(row, admin_store) for row in rows]})
+
+    @app.post("/api/admin/users")
+    @admin_required
+    def admin_user_create():
+        info = admin.request_admin()
+        from .accounts import get_store
+        body = request.get_json(silent=True) or {}
+        email = str(body.get("email") or "").strip().lower()
+        password = body.get("password") or ""
+        name = body.get("name") or ""
+        if not email or not password:
+            return jsonify({"error": "email and password are required"}), 400
+        if str(body.get("role") or "") not in ("", admin.ROLE_USER):
+            # New accounts start as users; becoming an administrator needs the
+            # separate, approved role change.
+            return jsonify({"error": "new accounts are created as users; use the "
+                                     "role endpoint to promote them"}), 400
+        created = get_store().create(email, password, name)
+        if not created.get("ok"):
+            error = created.get("error", "could not create the account")
+            return jsonify({"error": error}), (409 if "already registered" in error else 400)
+        admin.get_admin_store().audit(info["user_id"], "user_created",
+                                      {"user": created.get("id"),
+                                       "email": created.get("email")})
+        return jsonify({"ok": True, "id": created.get("id"),
+                        "email": created.get("email"),
+                        "role": created.get("role")}), 201
+
+    @app.route("/api/admin/users/<user_id>", methods=["PATCH", "DELETE"])
+    @admin_required
+    def admin_user_modify(user_id):
+        info = admin.request_admin()
+        from .accounts import get_store
+        store = get_store()
+        admin_store = admin.get_admin_store()
+        account = store.get(user_id)
+        if not account:
+            return jsonify({"error": "unknown account"}), 404
+        if request.method == "DELETE":
+            if user_id == info["user_id"]:
+                return jsonify({"error": "you cannot delete the account you are signed in as"}), 409
+            if admin_store.is_admin(user_id) and len(admin_store.admin_ids()) <= 1:
+                return jsonify({"error": "the last administrator cannot be deleted"}), 409
+            approval_id = str((request.get_json(silent=True) or {}).get("approval_id") or "")
+            record = None
+            if approval_id and admin_store.approved(approval_id, "delete_user"):
+                record = {"id": approval_id}
+            else:
+                record = admin_store.find_approved("delete_user", {"user_id": user_id})
+            if not record:
+                pending = admin_store.request_approval(
+                    "delete_user", {"user_id": user_id}, risk=admin.HIGH,
+                    requested_by=info["user_id"],
+                    note="deleting an account needs a recorded approval")
+                return jsonify({"error": "deleting an account needs an approval record",
+                                "approval": pending.get("id"), "status": "pending"}), 202
+            revoked = admin_store.revoke_user_sessions(
+                user_id, actor=info["user_id"], reason="account deleted")
+            store.delete(user_id)
+            admin_store.consume_approval(record["id"], actor=info["user_id"])
+            admin_store.audit(info["user_id"], "user_deleted",
+                              {"user": user_id, "email": account.get("email"),
+                               "sessions_revoked": revoked,
+                               "approval": record["id"]})
+            return jsonify({"ok": True, "deleted": user_id})
+
+        body = request.get_json(silent=True) or {}
+        allowed = {"name", "active", "approval_id"}
+        unknown = set(body) - allowed
+        if unknown:
+            return jsonify({"error": f"unknown field(s): {', '.join(sorted(unknown))}"}), 400
+        if not ({"name", "active"} & set(body)):
+            return jsonify({"error": "provide name or active"}), 400
+        if "name" in body:
+            if not isinstance(body["name"], str) or len(body["name"].strip()) > 80:
+                return jsonify({"error": "name must be text of at most 80 characters"}), 400
+            store.rename(user_id, body["name"])
+        if "active" in body:
+            if not isinstance(body["active"], bool):
+                return jsonify({"error": "active must be true or false"}), 400
+            if not body["active"]:
+                if user_id == info["user_id"]:
+                    return jsonify({"error": "you cannot deactivate yourself while "
+                                             "using admin mode"}), 409
+                if admin_store.is_admin(user_id) and len(admin_store.admin_ids()) <= 1:
+                    return jsonify({"error": "the last administrator cannot be "
+                                             "deactivated"}), 409
+                revoked = admin_store.revoke_user_sessions(
+                    user_id, actor=info["user_id"], reason="account deactivated")
+                store.set_active(user_id, False)
+                admin_store.audit(info["user_id"], "user_deactivated",
+                                  {"user": user_id, "sessions_revoked": revoked})
+                return jsonify({"ok": True, "active": False,
+                                "sessions_revoked": revoked})
+            store.set_active(user_id, True)
+            admin_store.audit(info["user_id"], "user_activated", {"user": user_id})
+        updated = store.get(user_id) or {}
+        return jsonify({"ok": True, "id": user_id,
+                        "name": updated.get("name") or "",
+                        "active": bool(updated.get("active", 1)),
+                        "role": updated.get("role") or "user"})
 
     @app.get("/api/admin/errors")
     @admin_required
     def admin_errors():
+        info = admin.request_admin()
         from . import jobs
-        history = [h for h in selfheal.recent(80) if h.get("kind") in ("error", "repair")]
-        failed = [j for j in jobs.get_jobs().list(limit=30) if j.get("state") == "error"]
-        return jsonify({"history": history, "failed_jobs": failed})
+
+        def _number(name, default, low, high):
+            raw = request.args.get(name)
+            if raw is None or str(raw).strip() == "":
+                return default, None
+            try:
+                value = int(str(raw).strip())
+            except ValueError:
+                return None, f"{name} must be an integer"
+            if value < low or value > high:
+                return None, f"{name} must be between {low} and {high}"
+            return value, None
+
+        limit, problem = _number("limit", 25, 1, 200)
+        if problem:
+            return jsonify({"error": problem}), 400
+        offset, problem = _number("offset", 0, 0, 100000)
+        if problem:
+            return jsonify({"error": problem}), 400
+        kind = str(request.args.get("kind") or "").strip().lower()
+        if kind and kind not in ("error", "repair"):
+            return jsonify({"error": "kind must be 'error' or 'repair'"}), 400
+        component = str(request.args.get("component") or "").strip()
+        if component and component not in selfheal.components():
+            return jsonify({"error": "unknown component"}), 400
+
+        history = [h for h in selfheal.recent(200)
+                   if h.get("kind") in ("error", "repair")]
+        if kind:
+            history = [h for h in history if h.get("kind") == kind]
+        if component:
+            history = [h for h in history if h.get("component") == component]
+        total = len(history)
+        page = history[offset:offset + limit]
+        failed = [j for j in jobs.get_jobs().list(limit=30)
+                  if j.get("state") == "error"]
+        admin.get_admin_store().audit(info["user_id"], "errors_viewed",
+                                      {"count": len(page), "total": total,
+                                       "offset": offset})
+        return jsonify({
+            "history": [_scrub_tree(h) for h in page],
+            "failed_jobs": [_scrub_tree(j) for j in failed],
+            "total": total, "limit": limit, "offset": offset,
+            "next_offset": (offset + limit) if offset + limit < total else None,
+        })
+
+    @app.get("/api/admin/errors/<error_id>")
+    @admin_required
+    def admin_error_detail(error_id):
+        info = admin.request_admin()
+        if not re.match(r"^[0-9a-f]{6,32}$", str(error_id or "")):
+            return jsonify({"error": "invalid error id"}), 404
+        item = selfheal.entry(error_id)
+        if not item:
+            return jsonify({"error": "unknown error"}), 404
+        admin.get_admin_store().audit(info["user_id"], "error_viewed",
+                                      {"id": error_id})
+        return jsonify({"item": _scrub_tree(item)})
 
     # -- MFA ---------------------------------------------------------------
 

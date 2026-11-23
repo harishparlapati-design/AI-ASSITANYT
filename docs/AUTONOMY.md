@@ -21,6 +21,13 @@ absolute lifetime**; every check refreshes the idle window, expiry revokes the
 row. `admin_required` re-validates it on every privileged request, so hiding a
 button grants nothing.
 
+Validation is not just the token. On **every** privileged request the account is
+read again: if it no longer has the administrator role, or is deactivated or
+deleted, the token is revoked on the spot and the request is refused. Demotion
+and deactivation additionally revoke **all** elevations that account holds, so a
+second browser, a phone or a copied cookie stops working immediately. Other
+administrators are untouched.
+
 Chat follows the same rule: `admin_commands.handle()` recognises a command
 deterministically, then asks for the *verified* elevation of the request. The
 elevation is attached by the web layer in `ui._execute`, never parsed from the
@@ -37,6 +44,27 @@ promoted once, automatically, during migration. Create the account with:
 ```bash
 python -m harry_core.hosted --create-user you@example.com
 ```
+
+On the desktop app, `/admin` offers the same thing through
+`POST /api/admin/bootstrap` while no account exists. That route is deliberately
+narrow:
+
+* it is **disabled entirely** on hosted Harry (403 for everyone, including
+  administrators; anonymous callers get the hosted gate's 401);
+* it requires a direct connection from `127.0.0.1`/`::1` **and** a loopback
+  `Host` header (`localhost`, `127.0.0.1`, `[::1]`);
+* any forwarding header — `X-Forwarded-For`, `X-Forwarded-Host`,
+  `X-Forwarded-Proto`, `Forwarded`, `X-Real-IP`, `CF-Connecting-IP` — is refused
+  rather than interpreted, because a proxy makes a remote client look local;
+  trusting a proxy requires an explicit operator decision that does not exist
+  for first-run setup;
+* an `Origin` header must match the request host exactly (scheme, host and port)
+  and `Sec-Fetch-Site` may only be `same-origin` or `none`, so a page on another
+  site cannot trigger setup;
+* the account is created atomically (`BEGIN IMMEDIATE`): concurrent attempts
+  produce exactly one administrator and the losers are refused with 409 without
+  leaving an account behind;
+* success does **not** elevate the session — the password must be entered again.
 
 Nothing is hard-coded, and no default password exists.
 
@@ -158,9 +186,14 @@ All endpoints are server-authorized:
 | `GET /api/admin/approvals`, `POST .../<id>` | approval queue |
 | `GET /api/admin/audit` | append-only admin audit |
 | `GET /api/admin/sessions`, `POST .../<id>/revoke` | device/session management |
-| `GET /api/admin/users`, `POST .../<id>/role` | accounts; role change needs approval |
+| `GET /api/admin/users` | accounts with role and state; never password material |
+| `POST /api/admin/users` | create a user (new accounts are never administrators) |
+| `PATCH /api/admin/users/<id>` | rename, activate, deactivate (deactivation revokes elevations) |
+| `DELETE /api/admin/users/<id>` | delete; requires an approval record; refuses self and the last administrator |
+| `POST /api/admin/users/<id>/role` | role change; requires approval; demotion revokes all elevations |
 | `POST /api/admin/mfa/{enroll,confirm,disable}` | second factor |
-| `GET /api/admin/errors` | self-heal history + failed jobs |
+| `GET /api/admin/errors` | self-heal history + failed jobs, `limit`/`offset`/`kind`/`component` filters, scrubbed text |
+| `GET /api/admin/errors/<id>` | one error report by id (404 for unknown or malformed ids) |
 | `GET /api/admin/policy` | the policy this code enforces |
 
 Chat commands (when elevated): full diagnostic, system health, repair, inspect
@@ -174,7 +207,29 @@ rollback and repair is written to the `admin_audit` table **and**
 `logs/audit.jsonl`, with secrets scrubbed by `logging_setup.scrub`. There is no
 endpoint that deletes or edits audit rows.
 
+### Errors and privacy
+
+Error reports are administrator-only. Every string is passed through the log
+scrubber (API keys, `password=`-style values, bearer tokens) and the application
+directory is replaced with `<app>`, so a report can be shared without leaking a
+credential or a local path. Listing and reading a report are both audited.
+Pagination is strict: a non-integer, an out-of-range limit/offset, an unknown
+kind or component is a 400 rather than a silent default, and the response
+includes `total`, `limit`, `offset` and `next_offset`.
+
 ## 9. Tests
+
+`tests/admin_api_test.py` — **82 checks** for demotion (including reuse of the
+old elevation and a second administrator staying unaffected), the users API
+(list, create, update, delete, deactivate, role restrictions, invalid input,
+duplicates, authorization, hosted bootstrap refusal) and the errors API
+(authorization, pagination, invalid identifiers, empty results, secret
+redaction, path privacy, audit).
+
+`tests/bootstrap_test.py` — **31 checks** for first-run setup: external and
+cross-site clients, spoofed `Origin`, spoofed forwarded headers, invalid and
+suffix-spoofed `Host`, legitimate local setup, single-use, and eight concurrent
+attempts yielding exactly one administrator.
 
 `tests/autonomy_test.py` — **124 checks**, all through the real Flask app and
 real files:
