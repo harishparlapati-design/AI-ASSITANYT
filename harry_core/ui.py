@@ -167,6 +167,38 @@ def create_app():
     def index():
         return _INDEX_HTML
 
+    # ---------------- installable app ----------------
+
+    @app.get("/manifest.webmanifest")
+    def web_manifest():
+        from . import pwa
+        response = jsonify(pwa.manifest())
+        response.headers["Content-Type"] = "application/manifest+json"
+        response.headers["Cache-Control"] = "public, max-age=3600"
+        return response
+
+    @app.get("/sw.js")
+    def service_worker():
+        from . import pwa
+        response = Response(pwa.SERVICE_WORKER, mimetype="application/javascript")
+        response.headers["Cache-Control"] = "no-cache"
+        response.headers["Service-Worker-Allowed"] = "/"
+        return response
+
+    @app.get("/icons/<icon_file>")
+    def app_icon(icon_file):
+        from . import pwa
+        if icon_file == "favicon.ico":
+            return Response(pwa.icon_png(64), mimetype="image/png")
+        match = __import__("re").fullmatch(r"(maskable-)?(192|512|180|1024)\.png", str(icon_file or ""))
+        if not match:
+            return jsonify({"error": "unknown icon"}), 404
+        size = int(match.group(2))
+        data = pwa.icon_png(size, maskable=bool(match.group(1)))
+        response = Response(data, mimetype="image/png")
+        response.headers["Cache-Control"] = "public, max-age=86400"
+        return response
+
     @app.get("/vr")
     def vr():
         """WebXR front-end (optional): the desktop/mobile UI is unaffected."""
@@ -869,7 +901,16 @@ _INDEX_HTML = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <title>Harry — local AI workspace</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b1526">
+<meta name="description" content="Harry: your personal AI assistant with voice, vision, documents and tasks.">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Harry">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icons/favicon.ico" sizes="64x64">
+<link rel="apple-touch-icon" href="/icons/180.png">
 <style>
   :root {
     color-scheme:dark;
@@ -1110,6 +1151,8 @@ _INDEX_HTML = """<!doctype html>
   <header class="topbar">
     <div class="brand"><div class="brand-mark" aria-hidden="true">H</div><div><h1>HARRY</h1><small>LOCAL AI WORKSPACE</small></div></div>
     <span id="headerState" class="status-chip" data-state="ready">ready</span>
+    <button id="installApp" class="ghost small-btn" hidden>Install app</button>
+    <span id="netState" class="chip" data-state="ready" hidden>offline</span>
     <span class="top-spacer"></span>
     <label class="top-control">Theme
       <select id="themeSel" aria-label="Dashboard theme"><option value="system">System</option><option value="dark">Dark</option><option value="light">Light</option></select>
@@ -2732,6 +2775,45 @@ es.addEventListener('job_finished', function(e){
   if (d && (d.kind === 'image' || d.kind === 'video')) refreshMedia();
 });
 refreshMedia();
+
+/* ---------------- installable app / offline ---------------- */
+let installPrompt = null;
+window.addEventListener('beforeinstallprompt', function(event){
+  event.preventDefault();
+  installPrompt = event;
+  document.getElementById('installApp').hidden = false;
+});
+document.getElementById('installApp').addEventListener('click', async function(){
+  if (!installPrompt){ sys('Open the browser menu and choose “Add to home screen”.'); return; }
+  installPrompt.prompt();
+  const choice = await installPrompt.userChoice.catch(function(){ return null; });
+  installPrompt = null;
+  this.hidden = true;
+  if (choice && choice.outcome === 'accepted') sys('Harry is installed. Open it from your home screen.');
+});
+window.addEventListener('appinstalled', function(){
+  document.getElementById('installApp').hidden = true;
+  sys('Harry is installed as an app.');
+});
+
+function updateNetworkState(){
+  const chipEl = document.getElementById('netState');
+  const offline = !navigator.onLine;
+  chipEl.hidden = !offline;
+  chipEl.textContent = offline ? 'offline' : 'online';
+  chipEl.dataset.state = offline ? 'error' : 'ready';
+}
+window.addEventListener('online', function(){ updateNetworkState(); sys('Back online.'); });
+window.addEventListener('offline', function(){ updateNetworkState(); sys('Network lost — Harry keeps what you typed until you reconnect.'); });
+updateNetworkState();
+
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', function(){
+    navigator.serviceWorker.register('/sw.js').catch(function(e){
+      sys('Offline shell not installed: ' + humanError(e));
+    });
+  });
+}
 
 addMsg('sys', 'Harry ready. Type, or press 🎤 to talk. Voice and text share this conversation.');
 refreshState();
