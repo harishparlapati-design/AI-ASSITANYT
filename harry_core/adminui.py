@@ -88,6 +88,15 @@ PAGE = r"""<!doctype html>
     <input id="code" inputmode="numeric" autocomplete="one-time-code" placeholder="123456">
     <div class="err" id="loginErr" hidden></div>
     <div class="row" style="margin-top:14px"><button class="primary" onclick="enterAdmin()">Enter admin mode</button></div>
+    <div id="setupBox" hidden style="margin-top:18px;padding-top:16px;border-top:1px solid var(--line)">
+      <h2 style="margin-top:0">First-run setup</h2>
+      <p class="muted">No account exists on this installation. The first account becomes the
+        administrator. This is allowed only from this computer (loopback).</p>
+      <label for="setupEmail">Email</label><input id="setupEmail" type="email" autocomplete="username">
+      <label for="setupPw">Password (12+ characters)</label><input id="setupPw" type="password" autocomplete="new-password">
+      <div class="err" id="setupErr" hidden></div>
+      <div class="row" style="margin-top:12px"><button class="primary" onclick="bootstrapAdmin()">Create administrator</button></div>
+    </div>
   </div>
 
   <div id="panel" hidden>
@@ -205,6 +214,7 @@ async function checkSession(){
     $('mode').textContent=ADMIN?('admin · '+ (s.email||'')):'not elevated';
     $('mode').className='pill '+(ADMIN?'on':'off');
     $('loginCard').hidden=ADMIN;$('panel').hidden=!ADMIN;$('exitBtn').hidden=!ADMIN;
+    $('setupBox').hidden = !(s && s.needs_setup);
     if(ADMIN){
       $('banner').hidden=true;
       $('mfaState').textContent=s.mfa?'MFA is enabled for this account.':'MFA is not enabled. Enroll an authenticator for a second factor.';
@@ -224,6 +234,17 @@ async function enterAdmin(){
     CSRF=r.csrf||CSRF;$('pw').value='';$('code').value='';
     await checkSession();
   }catch(e){showError('loginErr',e.message);}
+}
+async function bootstrapAdmin(){
+  showError('setupErr','');
+  try{
+    await api('/api/admin/bootstrap',{method:'POST',body:{email:$('setupEmail').value,password:$('setupPw').value}});
+    $('email').value=$('setupEmail').value;
+    $('setupPw').value='';
+    $('setupBox').hidden=true;
+    alert('Administrator created. Now enter the password below to elevate.');
+    checkSession();
+  }catch(e){showError('setupErr',e.message);}
 }
 async function exitAdmin(){
   try{await api('/api/admin/exit',{method:'POST',body:{}});}catch(_){}
@@ -594,9 +615,16 @@ def install(app):
             role = admin.get_admin_store().role(identity)
         if info and not session.get("admin_csrf"):
             session["admin_csrf"] = secrets.token_urlsafe(24)
+        needs_setup = False
+        try:
+            from .accounts import get_store
+            needs_setup = get_store().count() == 0
+        except Exception:
+            needs_setup = False
         return jsonify({
             "authenticated": bool(identity),
             "admin": bool(info),
+            "needs_setup": needs_setup,
             "email": (info or {}).get("email") or session.get("harry_email", ""),
             "role": role,
             "csrf": session.get("csrf") or session.get("admin_csrf") or "",
@@ -668,6 +696,27 @@ def install(app):
         return jsonify({"ok": True, "csrf": session["admin_csrf"],
                         "expires_in": result["expires_in"],
                         "idle_seconds": result["idle_seconds"]})
+
+    @app.post("/api/admin/bootstrap")
+    def admin_bootstrap():
+        """Create the very first administrator. Loopback only, zero accounts only."""
+        from .accounts import get_store
+        from flask import request as _req
+        if _hosted():
+            return jsonify({"error": "create accounts from the operator CLI on hosted Harry"}), 403
+        if not (request.remote_addr or "").startswith("127.") and request.remote_addr != "::1":
+            return jsonify({"error": "first-run setup is only allowed from this computer"}), 403
+        store = get_store()
+        if store.count() != 0:
+            return jsonify({"error": "an account already exists"}), 409
+        body = request.get_json(silent=True) or {}
+        created = store.create(body.get("email", ""), body.get("password", ""))
+        if not created.get("ok"):
+            return jsonify({"error": created.get("error", "could not create the account")}), 400
+        admin.get_admin_store().audit(created.get("id"), "admin_bootstrapped",
+                                      {"email": created.get("email")}, _client_ip())
+        return jsonify({"ok": True, "email": created.get("email"),
+                        "role": created.get("role")})
 
     @app.post("/api/admin/exit")
     def admin_exit():
