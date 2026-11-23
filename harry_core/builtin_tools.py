@@ -459,32 +459,20 @@ def window_list(args):
 # --------------------------------------------------------------------------- vision
 
 def vision_analyze(args):
-    """Understand an image with a local vision model if configured, else basic OCR."""
+    """Understand an image with a real vision provider (local model or hosted)."""
+    from . import vision
     path = _root(args.get("path", ""))
-    question = str(args.get("question", "Describe this image."))
+    question = str(args.get("question") or vision.DEFAULT_QUESTION)
     if not os.path.exists(path):
         return {"ok": False, "error": f"image not found: {path}"}
-    vision_model = config.CONFIG["models"].get("vision_model", "")
-    if vision_model and llm.get_router().local.has_model(vision_model):
-        try:
-            import base64
-            with open(path, "rb") as f:
-                b64 = base64.b64encode(f.read()).decode()
-            messages = [{"role": "user", "content": question,
-                         "images": [b64]}]
-            answer = llm.chat(messages, task_class=llm.VISION)
-            return {"ok": True, "analysis": answer, "model": vision_model}
-        except Exception as e:
-            log.warning("vision model failed (%s); trying OCR", e)
-    # fallback: OCR via pytesseract if present
-    try:
-        import pytesseract
-        from PIL import Image
-        text = pytesseract.image_to_string(Image.open(path))
-        return {"ok": True, "analysis": text.strip()[:4000], "method": "ocr"}
-    except Exception as e:
-        return {"ok": False,
-                "error": f"no vision model configured and OCR unavailable ({e})"}
+    result = vision.analyze_file(path, question=question,
+                                 timeout=int(args.get("timeout") or 180))
+    if not result.get("ok"):
+        return {"ok": False, "error": result.get("error"),
+                "hint": result.get("hint"), "details": result.get("details")}
+    return {"ok": True, "analysis": result.get("text"),
+            "method": result.get("method"), "model": result.get("model"),
+            "ms": result.get("ms"), "ocr_text": result.get("ocr_text")}
 
 
 def understand_screen(args):

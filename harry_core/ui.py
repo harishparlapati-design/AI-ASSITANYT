@@ -181,6 +181,14 @@ def create_app():
         rid = str(payload.get("request_id") or "").strip() or uuid.uuid4().hex
         source = "ui-voice" if payload.get("source") == "ui-voice" else "ui"
         wait = bool(payload.get("wait"))
+        # Screen context is only accepted from a live sharing session, and only
+        # as text the vision model produced - never an arbitrary client claim.
+        if payload.get("use_screen_context"):
+            from .screen import get_screen
+            context = get_screen().context_for_chat()
+            if context:
+                text = ("[What is currently on my screen, as described by the "
+                        "vision model]\n" + context + "\n\n" + text)
 
         with _requests_lock:
             existing = _requests.get(rid)
@@ -551,6 +559,57 @@ def create_app():
         result = cancel_agent(task_id)
         return jsonify(result), (200 if result.get("ok") else 400)
 
+    # ---------------- screen sharing / vision ----------------
+
+    @app.get("/api/screen")
+    def screen_status():
+        from .screen import get_screen
+        return jsonify(get_screen().status())
+
+    @app.post("/api/screen")
+    def screen_control():
+        from .screen import get_screen
+        payload = request.get_json(silent=True) or {}
+        action = str(payload.get("action") or "").strip()
+        session = get_screen()
+        if action == "start":
+            return jsonify(session.start(source=payload.get("source") or "browser"))
+        if action == "pause":
+            return jsonify(session.pause())
+        if action == "resume":
+            return jsonify(session.resume())
+        if action == "stop":
+            return jsonify(session.stop())
+        return jsonify({"error": "unknown action"}), 400
+
+    @app.post("/api/screen/frame")
+    def screen_frame():
+        """Analyse one browser frame. Refused unless sharing is active."""
+        import base64
+        import binascii
+        from .screen import get_screen
+        payload = request.get_json(silent=True) or {}
+        raw = payload.get("image")
+        if not isinstance(raw, str) or not raw.strip():
+            return jsonify({"error": "no frame supplied"}), 400
+        data = raw.strip()
+        if data.startswith("data:"):
+            comma = data.find(",")
+            if comma == -1 or ";base64" not in data[:comma]:
+                return jsonify({"error": "frame must be a base64 data URL"}), 400
+            data = data[comma + 1:]
+        if len(data) > 12 * 1024 * 1024:
+            return jsonify({"error": "frame is too large"}), 413
+        try:
+            image = base64.b64decode(data, validate=True)
+        except (binascii.Error, ValueError):
+            return jsonify({"error": "frame is not valid base64"}), 400
+        if len(image) > 8 * 1024 * 1024:
+            return jsonify({"error": "frame is larger than 8 MB"}), 413
+        question = str(payload.get("question") or "").strip()[:1500]
+        result, status_code = get_screen().accept_frame(image, question=question or None)
+        return jsonify(result), status_code
+
     # ---------------- background jobs (documents, media) ----------------
 
     @app.get("/api/jobs")
@@ -811,6 +870,9 @@ _INDEX_HTML = """<!doctype html>
   #mic.on { background:var(--err);color:white; }
   #micstop { padding:8px 11px; }
   #statusbar { display:flex;align-items:center;gap:11px;flex-wrap:wrap;padding:3px 19px 14px;color:var(--dim);font-size:11px; }
+  #screenshare[data-state=sharing]::before { background:var(--err);animation:screen-pulse 1.3s ease-in-out infinite; }
+  #screenshare[data-state=paused]::before { background:var(--warn); }
+  @keyframes screen-pulse { 50%{opacity:.2} }
   #hint { margin-left:auto; }
   .rightbar { display:flex;flex-direction:column;gap:12px; }
   .rightbar .panel-heading { margin-bottom:8px; }
@@ -973,9 +1035,15 @@ _INDEX_HTML = """<!doctype html>
       </form>
       <div id="statusbar">
         <span id="micstate" class="chip" data-state="ready">ready</span>
+        <span id="screenshare" class="chip" data-state="idle" hidden>screen off</span>
+        <button id="screenStart" type="button" class="ghost small-btn">🖥 Share screen</button>
+        <button id="screenAsk" type="button" class="ghost small-btn" hidden>👁 Ask about screen</button>
+        <button id="screenPause" type="button" class="ghost small-btn" hidden>Pause reading</button>
+        <button id="screenStop" type="button" class="danger small-btn" hidden>Stop sharing</button>
         <label><input type="checkbox" id="autosend" checked> auto-send spoken text</label>
         <span id="hint"></span>
       </div>
+      <video id="screenVideo" autoplay muted playsinline style="display:none"></video>
     </main>
     <aside class="panel rightbar">
       <section>
@@ -1200,7 +1268,8 @@ async function submit(text, opts){
       body: JSON.stringify({
         text: text,
         request_id: rid,
-        source: (opts && opts.voice) ? 'ui-voice' : 'ui'
+        source: (opts && opts.voice) ? 'ui-voice' : 'ui',
+        use_screen_context: !!(opts && opts.screenContext)
       })
     });
     if (res.status === 400){ sys('Nothing to send.'); finishPending(); return; }
@@ -1504,7 +1573,7 @@ es.addEventListener('user_message', function(e){
     else if (name === 'task_error') sys('⚠ ' + d.error);
     else if (name === 'reminder_due') addMsg('harry', '⏰ ' + d.text);
     else if (name === 'daily_briefing') addMsg('harry', '☀️ ' + d.active_tasks + ' active tasks');
-    else if (name === 'emergency_stop'){ sys('🛑 ' + d.reason); finishPending(); }
+    else if (name === 'emergency_stop'){ sys('🛑 ' + d.reason); finishPending(); stopScreenShare('emergency stop'); }
     scheduleRefresh();
   });
 });
@@ -2041,6 +2110,146 @@ document.getElementById('cancelAgent').addEventListener('click', async function(
 
 loadPreferences().then(function(){ refreshIntegrations(true); });
 loadVoice();
+
+/* ---------------- screen sharing (real browser capture) ---------------- */
+let screenStream = null, screenTimer = null, screenBusy = false, screenState = 'inactive';
+
+function setScreenState(state, text){
+  screenState = state;
+  const chipEl = document.getElementById('screenshare');
+  if (chipEl){
+    chipEl.hidden = state === 'inactive';
+    chipEl.dataset.state = state === 'sharing' ? 'sharing' : (state === 'paused' ? 'paused' : 'idle');
+    chipEl.textContent = text || 'screen off';
+  }
+  const start = document.getElementById('screenStart');
+  const ask = document.getElementById('screenAsk');
+  const pause = document.getElementById('screenPause');
+  const stop = document.getElementById('screenStop');
+  if (start) start.hidden = state !== 'inactive';
+  if (ask) ask.hidden = state === 'inactive';
+  if (pause){ pause.hidden = state === 'inactive'; pause.textContent = state === 'paused' ? 'Resume reading' : 'Pause reading'; }
+  if (stop) stop.hidden = state === 'inactive';
+}
+
+function captureScreenFrame(){
+  const video = document.getElementById('screenVideo');
+  if (!video) return null;
+  const w = video.videoWidth, h = video.videoHeight;
+  if (!w || !h) return null;
+  const canvas = document.createElement('canvas');
+  canvas.width = w; canvas.height = h;
+  canvas.getContext('2d').drawImage(video, 0, 0, w, h);
+  return canvas.toDataURL('image/jpeg', 0.7);
+}
+
+async function readScreen(question){
+  const image = captureScreenFrame();
+  if (!image) return { ok: false, error: 'No frame yet — the share may still be starting.' };
+  try {
+    const res = await fetch('/api/screen/frame', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ image: image, question: question || '' })
+    });
+    const data = await res.json().catch(function(){ return {}; });
+    if (!res.ok || !data.ok){
+      return { ok: false, error: data.error || ('screen read failed (' + res.status + ')'), hint: data.hint, retry: data.retry_after };
+    }
+    return data;
+  } catch (e) {
+    return { ok: false, error: humanError(e) };
+  }
+}
+
+function scheduleScreenRefresh(delay){
+  if (screenTimer) clearTimeout(screenTimer);
+  screenTimer = setTimeout(async function(){
+    if (screenState !== 'sharing') return;
+    if (screenBusy){ scheduleScreenRefresh(4000); return; }
+    screenBusy = true;
+    const result = await readScreen('Describe what is visible, and read any text verbatim.');
+    screenBusy = false;
+    if (!result.ok && result.error) sys('Screen read: ' + result.error + (result.hint ? ' — ' + result.hint : ''));
+    scheduleScreenRefresh(20000);
+  }, delay || 20000);
+}
+
+async function startScreenShare(){
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia){
+    sys('This browser cannot share a screen. Use Chrome, Edge or Firefox on a desktop; phones do not allow screen capture.');
+    return;
+  }
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 2 }, audio: false });
+  } catch (e) {
+    sys('Screen sharing was not started: ' + humanError(e));
+    setScreenState('inactive', 'screen off');
+    return;
+  }
+  screenStream = stream;
+  const video = document.getElementById('screenVideo');
+  if (video){ video.srcObject = stream; try { await video.play(); } catch (_) {} }
+  const track = stream.getVideoTracks()[0];
+  if (track) track.addEventListener('ended', function(){ stopScreenShare('the browser stopped sharing'); });
+  try { await postJSON('/api/screen', { action: 'start', source: 'browser' }); }
+  catch (e) { sys('⚠ ' + humanError(e)); }
+  setScreenState('sharing', 'sharing screen');
+  sys('Screen sharing is on. Frames are analysed only here and never stored; stop at any time.');
+  scheduleScreenRefresh(800);
+}
+
+async function pauseOrResumeScreen(){
+  if (!screenStream) return;
+  const paused = screenState === 'paused';
+  screenStream.getVideoTracks().forEach(function(t){ t.enabled = paused; });
+  if (paused){
+    try { await postJSON('/api/screen', { action: 'resume' }); } catch (_) {}
+    setScreenState('sharing', 'sharing screen');
+    scheduleScreenRefresh(600);
+  } else {
+    if (screenTimer) clearTimeout(screenTimer);
+    try { await postJSON('/api/screen', { action: 'pause' }); } catch (_) {}
+    setScreenState('paused', 'screen paused');
+  }
+}
+
+async function stopScreenShare(reason){
+  if (screenTimer){ clearTimeout(screenTimer); screenTimer = null; }
+  if (screenStream){
+    screenStream.getTracks().forEach(function(t){ try { t.stop(); } catch (_) {} });
+    screenStream = null;
+  }
+  const video = document.getElementById('screenVideo');
+  if (video) video.srcObject = null;
+  setScreenState('inactive', 'screen off');
+  try { await postJSON('/api/screen', { action: 'stop' }); } catch (_) {}
+  if (reason) sys('Screen sharing stopped: ' + reason + '.');
+}
+
+async function askAboutScreen(){
+  if (screenState !== 'sharing'){ sys('Start screen sharing first.'); return; }
+  const question = input.value.trim() || 'What is on my screen right now?';
+  setScreenState('reading', 'reading screen…');
+  const result = await readScreen('Describe this screen and read every piece of text, error message and label verbatim.');
+  setScreenState('sharing', 'sharing screen');
+  if (!result.ok){
+    sys('Screen read failed: ' + (result.error || 'unknown error') + (result.hint ? ' — ' + result.hint : ''));
+    return;
+  }
+  sys('Screen read with ' + (result.method || 'vision') + ' in ' + (result.ms || 0) + ' ms.');
+  input.value = '';
+  submit(question, { screenContext: true });
+  scheduleScreenRefresh(20000);
+}
+
+document.getElementById('screenStart').addEventListener('click', startScreenShare);
+document.getElementById('screenAsk').addEventListener('click', askAboutScreen);
+document.getElementById('screenPause').addEventListener('click', pauseOrResumeScreen);
+document.getElementById('screenStop').addEventListener('click', function(){ stopScreenShare('you stopped sharing'); });
+window.addEventListener('beforeunload', function(){
+  if (screenStream){ screenStream.getTracks().forEach(function(t){ try { t.stop(); } catch (_) {} }); }
+});
 
 /* ---------------- document generation ---------------- */
 let docJobId = null, docJobTimer = null;
