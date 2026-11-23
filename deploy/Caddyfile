@@ -1,0 +1,21 @@
+{$HARRY_DOMAIN} {
+    encode zstd gzip
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "no-referrer"
+        -Server
+    }
+    # SSE needs no buffering and a long read timeout.
+    reverse_proxy harry:8000 {
+        flush_interval -1
+        transport http {
+            read_timeout 1h
+            write_timeout 1h
+        }
+    }
+    log {
+        output stdout
+        format console
+    }
+}

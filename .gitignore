@@ -42,3 +42,6 @@ build/*
 !build/harry.spec
 dist/
 harry_build_info.py
+
+# Hosted deployment secrets (created locally, never committed)
+deploy/.env

@@ -1,0 +1,23 @@
+# Hosted Harry (Linux container). Deliberately smaller than requirements.txt:
+# no audio capture, TTS engine, wake word or CPU torch stack. Voice in the
+# hosted UI uses the browser's own speech recognition and speech synthesis.
+requests>=2.31
+beautifulsoup4>=4.12
+psutil>=5.9
+Flask>=3.0
+gunicorn>=21.2
+
+# Research / maths tools that are lightweight and dependency-free enough
+duckduckgo-search>=6.0
+wikipedia>=1.4
+sympy>=1.12
+
+# Document generation and validation
+python-docx>=1.1
+openpyxl>=3.1
+python-pptx>=0.6.23
+reportlab>=4.0
+pypdf>=4.0
+
+# Vision OCR is optional on the server; a hosted vision model is preferred.
+# pytesseract>=0.3.10

@@ -34,7 +34,7 @@ import time
 import uuid
 from urllib.parse import urlparse
 
-from . import config, runtime_paths
+from . import config, runtime_paths, tenant
 
 log = logging.getLogger("harry.media")
 
@@ -62,9 +62,12 @@ def _video_cfg():
 
 def media_root():
     base = os.environ.get("HARRY_MEDIA_DIR", "").strip()
-    if base:
-        return os.path.abspath(base)
-    return os.path.join(runtime_paths.workspace_root(), "data", "media")
+    if not base:
+        base = os.path.join(runtime_paths.workspace_root(), "data", "media")
+    base = os.path.abspath(base)
+    if not tenant.is_local():
+        base = os.path.join(base, tenant.current())
+    return base
 
 
 def _index_path():
@@ -137,7 +140,7 @@ def _store(data, kind, prompt, meta=None):
         "mime": mime, "prompt": str(prompt or "")[:2000],
         "meta": dict(meta or {}), "created": time.time(),
         "name": f"{kind}-{time.strftime('%Y%m%d-%H%M%S')}.{ext}",
-        "owner": "local",
+        "owner": tenant.current(),
     }
     items = _load_index()
     items[item_id] = record

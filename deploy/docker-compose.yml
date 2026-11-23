@@ -1,0 +1,53 @@
+# Harry + Caddy (automatic HTTPS) on any Docker host.
+#
+#   cp deploy/.env.example deploy/.env     # then edit it
+#   docker compose -f deploy/docker-compose.yml up -d --build
+#
+# Set HARRY_DOMAIN to a DNS name that points at this machine; Caddy obtains and
+# renews the certificate. Without a domain, comment out the caddy service and
+# reach Harry on http://<host>:8000 (fine for a LAN, not for the open internet).
+services:
+  harry:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: harry:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      HARRY_HOSTED: "1"
+      HARRY_HTTPS: "1"
+      HARRY_HOST: "0.0.0.0"
+      HARRY_PORT: "8000"
+    volumes:
+      - harry-data:/data
+      # Optional: bring your own config.json (providers, language, media).
+      # - ../config.json:/app/config.json:ro
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - harry
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      HARRY_DOMAIN: ${HARRY_DOMAIN:?set HARRY_DOMAIN in deploy/.env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  harry-data:
+  caddy-data:
+  caddy-config:

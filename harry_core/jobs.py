@@ -18,7 +18,7 @@ import threading
 import time
 import uuid
 
-from . import events, runtime_paths
+from . import events, runtime_paths, tenant
 
 log = logging.getLogger("harry.jobs")
 
@@ -92,7 +92,8 @@ class JobCancelled(Exception):
 class JobManager:
     def __init__(self, path=None):
         self.path = path or os.path.join(
-            runtime_paths.workspace_root(), "data", "jobs.json")
+            runtime_paths.workspace_root(), "data", "jobs",
+            f"{tenant.current()}.json")
         self.jobs = {}
         self._lock = threading.RLock()
         self._load()
@@ -147,7 +148,12 @@ class JobManager:
         self._save()
         events.emit("job_created", job.public(include_result=False))
 
+        owner = tenant.current()
+
         def worker():
+            # Background threads do not inherit request context: restore the
+            # tenant so a user's files never land in another user's folder.
+            token = tenant.set_tenant(owner)
             job.state = RUNNING
             job.message = "running"
             job.updated = time.time()
@@ -175,6 +181,7 @@ class JobManager:
                 job.updated = time.time()
                 self._save()
                 events.emit("job_finished", job.public())
+                tenant.reset(token)
 
         threading.Thread(target=worker, daemon=True,
                          name=f"job-{job.kind}-{job.id[-4:]}").start()
@@ -207,11 +214,16 @@ class JobManager:
         return {"ok": True, "job": job.public(include_result=False)}
 
 
-_manager = None
+_managers = {}
+_manager_lock = threading.Lock()
 
 
 def get_jobs():
-    global _manager
-    if _manager is None:
-        _manager = JobManager()
-    return _manager
+    """One job table per tenant, so hosted users never see each other's jobs."""
+    name = tenant.current()
+    with _manager_lock:
+        manager = _managers.get(name)
+        if manager is None:
+            manager = JobManager()
+            _managers[name] = manager
+        return manager

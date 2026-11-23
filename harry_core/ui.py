@@ -879,6 +879,12 @@ def create_app():
         response.headers["X-Content-Type-Options"] = "nosniff"
         return response
 
+    # Hosted mode adds login, CSRF and security headers. Off by default so the
+    # desktop app keeps its loopback-only behaviour.
+    from . import hosted
+    if hosted.enabled():
+        hosted.install(app)
+
     # subscribe_once: a second app object in the same process must not double
     # every event on the existing stream.
     events.subscribe_once(_q_listener)
@@ -1338,6 +1344,25 @@ _INDEX_HTML = """<!doctype html>
   </section>
 </div>
 <script>
+/* Hosted Harry signs requests with a CSRF token. Fetch one first, then attach
+   it to every unsafe same-origin request; locally the endpoint is absent and
+   nothing changes. */
+let csrfToken = null;
+const nativeFetch = window.fetch.bind(window);
+window.fetch = function(input, init){
+  init = init || {};
+  const method = String(init.method || 'GET').toUpperCase();
+  const url = typeof input === 'string' ? input : ((input && input.url) || '');
+  const sameOrigin = url.indexOf('/') === 0 || url.indexOf(location.origin) === 0;
+  if (csrfToken && method !== 'GET' && method !== 'HEAD' && sameOrigin){
+    init.headers = Object.assign({}, init.headers || {}, { 'X-CSRF-Token': csrfToken });
+  }
+  return nativeFetch(input, init);
+};
+nativeFetch('/api/session').then(function(r){ return r.ok ? r.json() : null; })
+  .then(function(data){ if (data && data.csrf) csrfToken = data.csrf; })
+  .catch(function(){});
+
 const log = document.getElementById('log');
 const input = document.getElementById('t');
 const sendBtn = document.getElementById('send');

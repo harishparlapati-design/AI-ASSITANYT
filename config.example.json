@@ -66,5 +66,31 @@
   "proactive": {
     "enabled": true,
     "briefing_hour": 8
+  },
+  "media": {
+    "image": {
+      "provider": "auto",
+      "diffusers_model": "data/models/sd-turbo",
+      "size": 512,
+      "steps": 4,
+      "automatic1111_url": "http://127.0.0.1:7860",
+      "comfyui_url": "http://127.0.0.1:8188",
+      "comfyui_workflow": "",
+      "openai_url": "https://api.openai.com/v1",
+      "openai_api_key_env": "OPENAI_API_KEY",
+      "openai_model": ""
+    },
+    "video": {
+      "provider": "auto",
+      "replicate_url": "https://api.replicate.com/v1",
+      "replicate_api_key_env": "REPLICATE_API_TOKEN",
+      "replicate_version": "",
+      "fal_url": "https://fal.run",
+      "fal_api_key_env": "FAL_KEY",
+      "fal_model": "",
+      "comfyui_url": "http://127.0.0.1:8188",
+      "comfyui_workflow": "",
+      "max_seconds": 10
+    }
   }
 }

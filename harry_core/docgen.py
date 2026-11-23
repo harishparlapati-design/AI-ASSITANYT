@@ -25,7 +25,7 @@ import threading
 import time
 import uuid
 
-from . import runtime_paths
+from . import runtime_paths, tenant
 
 log = logging.getLogger("harry.docgen")
 
@@ -44,9 +44,14 @@ _index_cache = {"path": None, "documents": {}}
 def documents_root():
     """Writable folder holding generated documents (git-ignored)."""
     base = os.environ.get("HARRY_DOCUMENTS_DIR", "").strip()
-    if base:
-        return os.path.abspath(base)
-    return os.path.join(runtime_paths.workspace_root(), "data", "documents")
+    if not base:
+        base = os.path.join(runtime_paths.workspace_root(), "data", "documents")
+    base = os.path.abspath(base)
+    if not tenant.is_local():
+        # Hosted: every account owns a folder. The tenant id is sanitised, so it
+        # can never contain a path separator.
+        base = os.path.join(base, tenant.current())
+    return base
 
 
 def _index_path():
@@ -642,7 +647,7 @@ def validate(path, fmt):
 # ------------------------------------------------------------------ public API
 
 def generate(fmt, title, content=None, spec=None, subtitle="", filename=None,
-             owner="local"):
+             owner=None):
     """Write one document and return its metadata (validated).
 
     ``content`` may be a string (Markdown-ish) or a dict spec.
@@ -686,7 +691,7 @@ def generate(fmt, title, content=None, spec=None, subtitle="", filename=None,
         "title": document_spec["title"],
         "created": time.time(),
         "elapsed_ms": elapsed_ms,
-        "owner": owner,
+        "owner": owner or tenant.current(),
         "validation": info,
     }
     documents[doc_id] = record
@@ -820,7 +825,7 @@ def generate_document(args):
         record = generate(fmt, title or (spec or {}).get("title", ""),
                           content=content, spec=spec,
                           subtitle=_text(args.get("subtitle") or ""),
-                          filename=args.get("filename"), owner="local")
+                          filename=args.get("filename"))
     except Exception as e:
         log.warning("document generation failed: %s", e)
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
