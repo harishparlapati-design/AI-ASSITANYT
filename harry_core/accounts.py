@@ -61,6 +61,19 @@ class AccountStore:
                 key TEXT PRIMARY KEY, failures INTEGER NOT NULL,
                 first REAL NOT NULL, last REAL NOT NULL)""")
             db.execute("CREATE INDEX IF NOT EXISTS users_email ON users(email)")
+            columns = {row["name"] for row in
+                       db.execute("PRAGMA table_info(users)").fetchall()}
+            if "role" not in columns:
+                db.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'")
+            if "totp_secret" not in columns:
+                db.execute("ALTER TABLE users ADD COLUMN totp_secret TEXT")
+            # A pre-existing single-user instance keeps working: the oldest
+            # account becomes the administrator.
+            admins = db.execute("SELECT COUNT(*) AS n FROM users WHERE role='admin'").fetchone()
+            if not admins or not admins["n"]:
+                oldest = db.execute("SELECT id FROM users ORDER BY created LIMIT 1").fetchone()
+                if oldest:
+                    db.execute("UPDATE users SET role='admin' WHERE id=?", (oldest["id"],))
 
     # -- hashing -----------------------------------------------------------
 
@@ -82,14 +95,17 @@ class AccountStore:
         user_id = "u_" + uuid.uuid4().hex[:12]
         try:
             with self._lock, self._connect() as db:
-                db.execute("INSERT INTO users (id, email, name, salt, hash, created) "
-                           "VALUES (?,?,?,?,?,?)",
+                # The first account owns the instance; later accounts are users.
+                existing = db.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
+                role = "admin" if not existing else "user"
+                db.execute("INSERT INTO users (id, email, name, salt, hash, created, role) "
+                           "VALUES (?,?,?,?,?,?,?)",
                            (user_id, email, str(name or "").strip()[:80],
-                            salt, self._hash(password, salt), time.time()))
+                            salt, self._hash(password, salt), time.time(), role))
         except sqlite3.IntegrityError:
             return {"ok": False, "error": "that email is already registered"}
-        log.info("account created: %s", user_id)
-        return {"ok": True, "id": user_id, "email": email}
+        log.info("account created: %s (%s)", user_id, role)
+        return {"ok": True, "id": user_id, "email": email, "role": role}
 
     def get(self, user_id):
         with self._lock, self._connect() as db:

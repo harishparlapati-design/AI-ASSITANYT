@@ -135,9 +135,15 @@ def create_app():
 
     # ---------------- request execution ----------------
 
-    def _execute(rid, text, source):
+    def _execute(rid, text, source, admin_info=None):
         started = time.perf_counter()
         entry = _requests.get(rid)
+        # Privileged commands are authorised by the verified elevation token, not
+        # by anything in the message. Contextvars must be set inside this thread.
+        admin_token = None
+        if admin_info:
+            from . import admin as _admin
+            admin_token = _admin.set_request_admin(admin_info)
         try:
             answer = brain.handle_input(text, source=source, request_id=rid)
             if entry is not None:
@@ -156,6 +162,9 @@ def create_app():
                                        "error": f"{type(e).__name__}: {e}",
                                        "attempt": 1})
         finally:
+            if admin_token is not None:
+                from . import admin as _admin
+                _admin.reset_request_admin(admin_token)
             if entry is not None:
                 entry["elapsed_ms"] = round((time.perf_counter() - started) * 1000)
                 log.info("request %s finished in %sms (%s)", rid,
@@ -246,11 +255,14 @@ def create_app():
             while len(_recent_submits) > _MAX_KEEP:
                 _recent_submits.pop(next(iter(_recent_submits)))
 
+        from . import adminui
+        admin_info = adminui.current()
+
         if wait:
-            _execute(rid, text, source)
+            _execute(rid, text, source, admin_info)
             return jsonify(_public(entry)), 200
 
-        threading.Thread(target=_execute, args=(rid, text, source),
+        threading.Thread(target=_execute, args=(rid, text, source, admin_info),
                          daemon=True, name=f"chat-{rid[:6]}").start()
         return jsonify(_public(entry)), 202
 
@@ -885,6 +897,12 @@ def create_app():
     if hosted.enabled():
         hosted.install(app)
 
+    # The administrator control plane exists in both modes. Every privileged
+    # route re-verifies the elevation token server-side, so this adds no public
+    # authority; it only publishes an authenticated surface.
+    from . import adminui
+    adminui.install(app)
+
     # subscribe_once: a second app object in the same process must not double
     # every event on the existing stream.
     events.subscribe_once(_q_listener)
@@ -1158,6 +1176,7 @@ _INDEX_HTML = """<!doctype html>
     <div class="brand"><div class="brand-mark" aria-hidden="true">H</div><div><h1>HARRY</h1><small>LOCAL AI WORKSPACE</small></div></div>
     <span id="headerState" class="status-chip" data-state="ready">ready</span>
     <button id="installApp" class="ghost small-btn" hidden>Install app</button>
+    <a href="/admin" id="adminLink" class="ghost small-btn" hidden>Admin</a>
     <span id="netState" class="chip" data-state="ready" hidden>offline</span>
     <span class="top-spacer"></span>
     <label class="top-control">Theme
@@ -1362,6 +1381,17 @@ window.fetch = function(input, init){
 nativeFetch('/api/session').then(function(r){ return r.ok ? r.json() : null; })
   .then(function(data){ if (data && data.csrf) csrfToken = data.csrf; })
   .catch(function(){});
+// The admin entry point is shown when this session is actually elevated; the
+// link itself grants nothing, every admin endpoint verifies the token.
+nativeFetch('/api/admin/session').then(function(r){ return r.ok ? r.json() : null; })
+  .then(function(data){
+    var link = document.getElementById('adminLink');
+    if (link && data && (data.admin || data.role === 'admin')){
+      link.hidden = false;
+      link.textContent = data.admin ? 'Admin · active' : 'Admin';
+      if (data.admin) link.style.borderColor = 'rgba(95,214,164,.5)';
+    }
+  }).catch(function(){});
 
 const log = document.getElementById('log');
 const input = document.getElementById('t');

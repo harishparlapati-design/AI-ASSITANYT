@@ -218,6 +218,24 @@ _managers = {}
 _manager_lock = threading.Lock()
 
 
+def recover_stale(max_age=1800):
+    """Fail jobs a crashed worker left ``running``. Used by self-healing."""
+    manager = get_jobs()
+    now = time.time()
+    recovered = []
+    with manager._lock:
+        for job in manager.jobs.values():
+            if job.state == RUNNING and now - float(job.updated or 0) > float(max_age):
+                job.state = ERROR
+                job.error = "interrupted; recovered by the self-healing engine"
+                job.message = "interrupted"
+                job.updated = now
+                recovered.append(job.id)
+        if recovered:
+            manager._save()
+    return {"ok": True, "recovered": recovered, "count": len(recovered)}
+
+
 def get_jobs():
     """One job table per tenant, so hosted users never see each other's jobs."""
     name = tenant.current()

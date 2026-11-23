@@ -55,6 +55,15 @@ class Tool:
             raise
         except Exception as e:
             log.exception("tool %s failed", self.name)
+            # A failing tool is diagnostic evidence: record it against the
+            # capability and let the self-healing engine classify the component.
+            try:
+                from . import capabilities as _caps, selfheal as _heal
+                _caps.record_error(self.name, e)
+                _heal.report_error("auto", f"{self.name}: {type(e).__name__}: {e}",
+                                   context=self.source)
+            except Exception:
+                pass
             return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
@@ -104,6 +113,13 @@ def get_registry():
         from .builtin_tools import register_builtins  # lazy: avoids import cycle
         register_builtins(_registry)
         load_legacy_tools(_registry)
+        try:
+            from .autonomy_tools import register as register_autonomy
+            register_autonomy(_registry)
+        except Exception as _e:  # pragma: no cover - defensive
+            import logging
+            logging.getLogger("harry.tools").warning(
+                "autonomy tools not registered: %s", _e)
     return _registry
 
 

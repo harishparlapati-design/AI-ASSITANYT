@@ -379,6 +379,14 @@ class Brain:
         if re.search(r"\b(what are you doing|status)\b", low) and self.busy:
             return finish(self._status_report())
 
+        # ---- administrator commands ----
+        # Recognition is deterministic, and the *verified* elevation from the web
+        # session decides whether a command may run. A sentence never elevates.
+        from . import admin_commands
+        admin_reply = admin_commands.handle(text)
+        if admin_reply is not None:
+            return finish(admin_reply)
+
         # ---- deterministic fast paths (never touch the model) ----
         fast = self._fast_reply(text, low)
         if fast is not None:
