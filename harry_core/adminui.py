@@ -65,6 +65,10 @@ PAGE = r"""<!doctype html>
   .tabs button{background:transparent}.tabs button.active{background:#16233a;border-color:var(--accent);color:#dbe4f7}
   .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
   section[hidden]{display:none}
+  .card.link{cursor:pointer;transition:border-color .15s,transform .15s}
+  .card.link:hover{border-color:rgba(99,132,243,.55);transform:translateY(-1px)}
+  .sub{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim);margin:12px 0 6px}
+  ul.tight{margin:0;padding-left:18px;font-size:12.5px}ul.tight li{margin:2px 0}
 </style></head>
 <body>
 <header>
@@ -101,9 +105,9 @@ PAGE = r"""<!doctype html>
   </div>
 
   <div id="panel" hidden>
-    <div class="grid" id="tiles"></div>
     <div class="tabs">
-      <button data-tab="health" class="active">Health</button>
+      <button data-tab="command" class="active">Command Center</button>
+      <button data-tab="health">Health</button>
       <button data-tab="capabilities">Capabilities</button>
       <button data-tab="plugins">Plugins</button>
       <button data-tab="upgrades">Upgrades</button>
@@ -113,7 +117,32 @@ PAGE = r"""<!doctype html>
       <button data-tab="security">Security</button>
     </div>
 
-    <section id="tab-health">
+    <section id="tab-command">
+      <div class="row" style="margin-bottom:12px">
+        <button class="primary" onclick="loadOverview(true)">Refresh overview</button>
+        <span id="ccState" class="pill">loading</span>
+        <span class="muted" id="ccUpdated"></span>
+      </div>
+      <div class="grid" id="ccTiles"></div>
+      <div class="grid" style="margin-top:14px">
+        <div class="card"><h2>System load</h2><div id="ccSystem"></div></div>
+        <div class="card"><h2>Jobs</h2><div id="ccJobs"></div></div>
+        <div class="card"><h2>Agents</h2><div id="ccAgents"></div></div>
+        <div class="card"><h2>Models</h2><div id="ccModels"></div></div>
+        <div class="card"><h2>Voice and devices</h2><div id="ccVoice"></div></div>
+        <div class="card"><h2>Database, network and plugins</h2><div id="ccData"></div></div>
+      </div>
+      <div class="grid" style="margin-top:14px">
+        <div class="card"><h2>Recent errors</h2><div id="ccErrors"></div></div>
+        <div class="card"><h2>Recent repairs</h2><div id="ccRepairs"></div></div>
+        <div class="card"><h2>Security events</h2><div id="ccSecurity"></div></div>
+      </div>
+      <div class="card" style="margin-top:14px"><h2>Build, backups and monitoring</h2>
+        <div id="ccBuild"></div></div>
+    </section>
+
+    <section id="tab-health" hidden>
+      <div class="grid" id="tiles" style="margin-bottom:14px"></div>
       <div class="row" style="margin-bottom:12px">
         <button onclick="runDiagnostics()">Run full diagnostic</button>
         <button onclick="healAll()">Repair healthy-repairable components</button>
@@ -255,7 +284,7 @@ async function checkSession(){
     if(ADMIN){
       $('banner').hidden=true;
       $('mfaState').textContent=s.mfa?'MFA is enabled for this account.':'MFA is not enabled. Enroll an authenticator for a second factor.';
-      loadHealth();loadCaps();loadPlugins();loadUpgrades();loadApprovals();loadAudit();loadSessions();loadPolicy();loadUsers();
+      loadOverview();loadHealth();loadCaps();loadPlugins();loadUpgrades();loadApprovals();loadAudit();loadSessions();loadPolicy();loadUsers();
     }else{
       $('banner').hidden=false;
       $('banner').textContent='Administrator mode is inactive. Authenticate below; natural-language claims of being the admin have no effect.';
@@ -589,6 +618,140 @@ async function disableMfa(){
   catch(e){alert(e.message);}
 }
 
+function activateTab(name){const b=document.querySelector('.tabs button[data-tab="'+name+'"]');if(b)b.click();}
+
+// ---- Command Center -------------------------------------------------
+let CC_BUSY=false;
+function pct(v){return (v===null||v===undefined)?'—':v+'%';}
+function yesno(v){return (v===null||v===undefined)?'unknown':(v?'yes':'no');}
+function fmtUptime(s){if(s===null||s===undefined)return '—';s=Math.max(0,Math.round(s));
+  const h=Math.floor(s/3600),m=Math.round((s%3600)/60);return h?h+'h '+m+'m':m+'m';}
+function fmtTime(ts){return ts?new Date(ts*1000).toLocaleString():'—';}
+function ago(ts){if(!ts)return 'never';const s=Math.max(0,Math.round(Date.now()/1000-ts));
+  return s<60?s+'s ago':s<3600?Math.round(s/60)+'m ago':Math.round(s/3600)+'h ago';}
+function kv(rows){return '<table>'+rows.map(r=>`<tr><td class="muted">${esc(r[0])}</td>
+  <td class="${r[2]||''}">${r[1]}</td></tr>`).join('')+'</table>';}
+function ccTile(label,value,tone,tab){
+  return `<div class="card${tab?' link':''}"${tab?` onclick="activateTab('${tab}')"`:''}>
+    <h2>${esc(label)}</h2><div class="big ${tone||''}">${esc(value)}</div></div>`;
+}
+function bullets(items,empty){
+  if(!items||!items.length)return `<p class="muted">${esc(empty)}</p>`;
+  return '<ul class="tight">'+items.map(i=>`<li>${esc(i)}</li>`).join('')+'</ul>';
+}
+
+async function loadOverview(manual){
+  if(CC_BUSY)return;
+  CC_BUSY=true;
+  try{
+    const o=await api('/api/admin/overview');
+    renderOverview(o);
+    if(manual)$('ccUpdated').textContent='Updated '+new Date((o.at||0)*1000).toLocaleTimeString();
+  }catch(e){
+    $('ccState').textContent='unavailable';
+    $('ccState').className='pill off';
+    $('ccTiles').innerHTML=`<div class="err">${esc(e.message)}</div>`;
+  }finally{CC_BUSY=false;}
+}
+
+function renderOverview(o){
+  const sys=o.system||{}, st=o.status||{};
+  $('ccState').textContent=st.state||'unknown';
+  $('ccState').className='pill '+(st.ok?'on':'off');
+  $('ccUpdated').textContent='Updated '+(o.at?new Date(o.at*1000).toLocaleTimeString():'—')+' · refreshes every 30s';
+  const jc=(o.jobs&&o.jobs.counts)||{};
+  const errs=(o.errors&&o.errors.count)||0;
+  $('ccTiles').innerHTML=[
+    ccTile('Harry',st.state||'unknown',st.ok?'ok':'bad','health'),
+    ccTile('CPU',pct(sys.cpu),(sys.cpu||0)>=90?'bad':'','health'),
+    ccTile('Memory',pct(sys.ram),(sys.ram||0)>=90?'bad':'','health'),
+    ccTile('Disk used',pct(sys.disk),(sys.disk||0)>=90?'bad':'','health'),
+    ccTile('Jobs running',String(jc.running||0),'','health'),
+    ccTile('Queued jobs',String(jc.queued||0),'','health'),
+    ccTile('Errors recorded',String(errs),errs?'warn':'ok','health'),
+    ccTile('Uptime',fmtUptime(o.uptime_seconds),'','health')
+  ].join('');
+
+  const lat=o.latency||{};
+  $('ccSystem').innerHTML=kv([
+    ['CPU',pct(sys.cpu),(sys.cpu||0)>=90?'bad':'ok'],
+    ['Memory',pct(sys.ram),(sys.ram||0)>=90?'bad':'ok'],
+    ['Disk used',pct(sys.disk)+((sys.disk_free_gb!==null&&sys.disk_free_gb!==undefined)?' · '+esc(sys.disk_free_gb)+' GB free':''),(sys.disk||0)>=90?'bad':'ok'],
+    ['GPU','not measured on this build','muted'],
+    ['Last sample',ago(sys.sampled_at),'muted'],
+    ['Response latency',lat.last_ms===null||lat.last_ms===undefined?'no traces yet':esc(lat.last_ms)+' ms last · '+esc(lat.avg_ms)+' ms average','muted']
+  ]);
+
+  const active=(o.jobs&&o.jobs.active)||[];
+  $('ccJobs').innerHTML=kv([
+    ['Running',String(jc.running||0)],['Queued',String(jc.queued||0)],
+    ['Done',String(jc.done||0)],['Failed',String(jc.error||0),(jc.error?'bad':'')],
+    ['Cancelled',String(jc.cancelled||0),'muted'],['Tracked jobs',String((o.jobs&&o.jobs.total)||0),'muted']
+  ])+(active.length?'<div class="sub">Active now</div><ul class="tight">'+active.map(j=>`<li>${esc(j.label||j.kind)} · ${esc(j.state)} · ${esc(j.progress||0)}%</li>`).join('')+'</ul>':'');
+
+  const agents=o.agents||[];
+  $('ccAgents').innerHTML=agents.length?`<table><tr><th>Agent</th><th>Class</th><th>Tools</th></tr>${
+    agents.map(a=>`<tr><td>${esc(a.name)}</td><td class="muted">${esc(a.task_class)}</td>
+      <td class="muted">${esc(a.tools)}</td></tr>`).join('')}</table>`:'<p class="muted">No agents registered.</p>';
+
+  const m=o.models||{};
+  $('ccModels').innerHTML=kv([
+    ['Local models',m.local_count?esc(m.local_count):'none answered',m.ok?'ok':'bad'],
+    ['Installed',m.local&&m.local.length?esc(m.local.join(', ')):'—','muted'],
+    ['Online provider',yesno(m.online),m.online?'ok':'muted']
+  ]);
+
+  const v=o.voice||{}, conv=v.conversation||{};
+  $('ccVoice').innerHTML=kv([
+    ['Microphone (STT)',yesno(v.microphone),v.microphone?'ok':'warn'],
+    ['Speaker (TTS)',yesno(v.speaker),v.speaker?'ok':'warn'],
+    ['Voice conversation',v.conversation?esc(conv.state||'idle'):'not started','muted'],
+    ['Utterances',v.conversation?esc(conv.utterances||0):'—','muted']
+  ]);
+
+  const db=o.database||{}, net=o.network, pl=o.plugins||{};
+  $('ccData').innerHTML=kv([
+    ['Database',db.ok?'connected':'unavailable',db.ok?'ok':'bad'],
+    ['Accounts',db.accounts===null||db.accounts===undefined?'—':esc(db.accounts),'muted'],
+    ['Internet',net?yesno(net.ok):'not sampled yet',net&&net.ok?'ok':'muted'],
+    ['Network latency',net&&net.ms!==null&&net.ms!==undefined?esc(net.ms)+' ms':'—','muted'],
+    ['Plugins loaded',pl.installed===null||pl.installed===undefined?'—':esc(pl.installed),'muted'],
+    ['Failing plugins',pl.failed&&pl.failed.length?esc(pl.failed.join(', ')):'none',pl.failed&&pl.failed.length?'bad':'ok'],
+    ['Awaiting approval',pl.pending&&pl.pending.length?esc(pl.pending.join(', ')):'none',pl.pending&&pl.pending.length?'warn':'muted']
+  ]);
+
+  const err=o.errors||{};
+  $('ccErrors').innerHTML=(err.recent&&err.recent.length)?`<table><tr><th>When</th><th>Component</th><th>Error</th></tr>${
+    err.recent.map(e=>`<tr><td class="muted">${fmtTime(e.at)}</td><td>${esc(e.component)}</td>
+      <td class="muted">${esc(e.error)}</td></tr>`).join('')}</table>`:'<p class="muted">No errors recorded.</p>';
+
+  const rep=(o.repairs&&o.repairs.recent)||[];
+  $('ccRepairs').innerHTML=rep.length?`<table><tr><th>When</th><th>Component</th><th>Result</th></tr>${
+    rep.map(r=>`<tr><td class="muted">${fmtTime(r.at)}</td><td>${esc(r.component)}</td>
+      <td class="${r.ok?'ok':'warn'}">${r.ok?'repaired':'still failing'}</td></tr>`).join('')}</table>`:'<p class="muted">No repairs yet.</p>';
+
+  const sec=o.security||{};
+  $('ccSecurity').innerHTML=kv([
+    ['Elevated sessions',sec.active_sessions===null||sec.active_sessions===undefined?'—':esc(sec.active_sessions),'muted'],
+    ['Actions refused',sec.denied===null||sec.denied===undefined?'—':esc(sec.denied),sec.denied?'warn':'muted']
+  ])+((sec.recent&&sec.recent.length)?('<div class="sub">Recent admin activity</div>'
+    +'<table><tr><th>When</th><th>Action</th></tr>'
+    +sec.recent.map(e=>`<tr><td class="muted">${fmtTime(e.at)}</td><td>${esc(e.action)}</td></tr>`).join('')
+    +'</table>'):'<p class="muted">No admin activity yet.</p>');
+
+  const g=o.git||{}, bk=o.backups||{}, mon=o.monitor||{};
+  $('ccBuild').innerHTML=kv([
+    ['Version',esc(o.version||'—'),'muted'],
+    ['Git branch',g.available?esc(g.branch||'detached'):'not a git checkout','muted'],
+    ['Git commit',g.available?esc(g.commit||'—'):'—','muted'],
+    ['Working tree',g.available?(g.dirty?'uncommitted changes':'clean'):'—',g.dirty?'warn':'muted'],
+    ['Backups',bk.ok?esc((bk.count||0)+' recorded'):'unavailable',bk.ok?'muted':'warn'],
+    ['Last backup',bk.last?esc((bk.last.label||'backup')+' · '+fmtTime(bk.last.created)+' · '+(bk.last.files||0)+' files'):'none yet','muted'],
+    ['Monitoring',mon.running?'running every '+esc(mon.interval)+'s':'not running',mon.running?'ok':'warn'],
+    ['Harry uptime',fmtUptime(o.uptime_seconds),'muted']
+  ]);
+}
+
 document.querySelectorAll('.tabs button').forEach(btn=>{
   btn.onclick=()=>{
     document.querySelectorAll('.tabs button').forEach(b=>b.classList.toggle('active',b===btn));
@@ -596,6 +759,7 @@ document.querySelectorAll('.tabs button').forEach(btn=>{
   };
 });
 $('pw').addEventListener('keydown',e=>{if(e.key==='Enter')enterAdmin();});
+setInterval(()=>{if(ADMIN&&!$('tab-command').hidden&&!document.hidden)loadOverview();},30000);
 checkSession();
 </script>
 </body></html>"""
@@ -787,10 +951,266 @@ def _tile_summary():
         "voice": "ready" if all(v.get("ok") for v in voice_checks.values()) and voice_checks
                  else "check needed",
         "voiceOk": bool(voice_checks) and all(v.get("ok") for v in voice_checks.values()),
-        "diskFree": f"{checks.get('disk', {}).get('free_gb', '?')} GB",
+        "diskFree": (f"{checks['disk']['free_gb']} GB" if checks.get("disk", {}).get("free_gb") is not None
+                     else "unknown"),
         "diskOk": (checks.get("disk", {}).get("value") or 0) < monitoring.settings()["disk_warn_percent"],
         "sessions": len([s for s in admin.get_admin_store().sessions() if s["active"]]),
         "unhealthy": str(len(snapshot.get("failed") or [])),
+    }
+
+
+# ------------------------------------------------------------------ overview
+
+
+_STARTED_AT = time.time()
+
+
+def _version():
+    from . import __version__
+    return str(__version__)
+
+
+def _git_revision():
+    """Branch, commit and dirty flag when the workspace is a git checkout."""
+    import subprocess
+    from . import runtime_paths
+    info = {"available": False, "branch": None, "commit": None, "dirty": None}
+    try:
+        root = runtime_paths.workspace_root()
+    except Exception:
+        return info
+    if not root or not os.path.isdir(os.path.join(root, ".git")):
+        return info
+
+    def git(*args):
+        try:
+            done = subprocess.run(["git", *args], cwd=root, timeout=3,
+                                  capture_output=True, text=True)
+        except Exception:
+            return ""
+        return (done.stdout or "").strip() if done.returncode == 0 else ""
+
+    branch = git("rev-parse", "--abbrev-ref", "HEAD")
+    commit = git("rev-parse", "--short", "HEAD")
+    if not branch and not commit:
+        return info
+    return {"available": True, "branch": branch or None, "commit": commit or None,
+            "dirty": bool(git("status", "--porcelain"))}
+
+
+def _overview_jobs():
+    from . import jobs
+    try:
+        items = jobs.get_jobs().list(limit=200)
+    except Exception as e:
+        return {"counts": {}, "total": None, "active": [], "error": _scrub_text(e)}
+    counts = {"queued": 0, "running": 0, "done": 0, "error": 0, "cancelled": 0}
+    for item in items:
+        state = str(item.get("state") or "")
+        if state in counts:
+            counts[state] += 1
+    active = [{"id": i.get("id"), "kind": i.get("kind"), "label": i.get("label"),
+               "state": i.get("state"), "progress": i.get("progress"),
+               "message": i.get("message"), "updated": i.get("updated")}
+              for i in items if i.get("state") in ("queued", "running")]
+    return {"counts": counts, "total": len(items), "active": active[:8]}
+
+
+def _overview_agents():
+    from . import agents
+    try:
+        return [{"key": a.get("key"), "name": a.get("name"),
+                 "description": a.get("description"),
+                 "task_class": a.get("task_class"),
+                 "tools": len(a.get("preferred_tools") or [])}
+                for a in agents.list_agents()]
+    except Exception:
+        return []
+
+
+def _overview_models():
+    from . import llm
+    try:
+        router = llm.get_router()
+        local = list(router.local_models())
+    except Exception as e:
+        return {"ok": False, "local": [], "local_count": None, "online": None,
+                "error": _scrub_text(e)}
+    try:
+        online = bool(router.online_available())
+    except Exception:
+        online = None
+    return {"ok": bool(local), "local": local[:8], "local_count": len(local),
+            "online": online}
+
+
+def _overview_voice(checks):
+    def state(key):
+        item = checks.get(key)
+        return bool(item.get("ok")) if isinstance(item, dict) else None
+
+    # Read the singleton only if something already created it: calling the
+    # accessor here would load the speech model just to draw a tile.
+    from . import conversation as _conversation
+    live = getattr(_conversation, "_conversation", None)
+    status = None
+    if live is not None:
+        try:
+            status = {"state": live.state, "utterances": int(live.utterances),
+                      "last_heard": str(getattr(live, "last_heard", ""))[:120]}
+        except Exception:
+            status = None
+    return {"microphone": state("stt"), "speaker": state("tts"),
+            "conversation": status}
+
+
+def _overview_database():
+    from . import accounts
+    try:
+        return {"ok": True, "accounts": int(accounts.get_store().count())}
+    except Exception as e:
+        return {"ok": False, "accounts": None, "error": _scrub_text(e)}
+
+
+def _overview_plugins():
+    try:
+        items = capabilities.list_capabilities()
+    except Exception as e:
+        return {"ok": False, "installed": None, "failed": [], "pending": [],
+                "error": _scrub_text(e)}
+    failed = [c.get("name") for c in items if c.get("status") == "failed"]
+    pending = [c.get("name") for c in items
+               if c.get("status") in ("pending", "invalid")]
+    return {"ok": not failed, "installed": len(items), "failed": failed[:5],
+            "pending": pending[:5]}
+
+
+def _overview_security():
+    try:
+        store = admin.get_admin_store()
+        entries = store.audit_entries(200)
+    except Exception as e:
+        return {"ok": False, "error": _scrub_text(e), "recent": [],
+                "active_sessions": None, "denied": None}
+    recent = [{"at": item.get("ts"), "action": item.get("action"),
+               "actor": str(item.get("user_id") or "")[:40]}
+              for item in entries[:6]]
+    try:
+        active = len([s for s in store.sessions() if s.get("active")])
+    except Exception:
+        active = None
+    denied = len([e for e in entries if "denied" in str(e.get("action"))])
+    return {"ok": True, "recent": recent, "active_sessions": active,
+            "denied": denied}
+
+
+def _overview_latency():
+    try:
+        from . import timing
+        traces = timing.recent(12)
+    except Exception:
+        return {"recent": 0, "avg_ms": None, "last_ms": None}
+    totals = []
+    for trace in traces:
+        try:
+            totals.append(float(trace.get("total") or 0) * 1000.0)
+        except (AttributeError, TypeError, ValueError):
+            continue
+    if not totals:
+        return {"recent": 0, "avg_ms": None, "last_ms": None}
+    return {"recent": len(totals),
+            "avg_ms": round(sum(totals) / len(totals)), "last_ms": round(totals[0])}
+
+
+def _overview_backups():
+    try:
+        items = selfdev.backups()
+    except Exception as e:
+        return {"ok": False, "count": None, "last": None, "error": _scrub_text(e)}
+    last = None
+    if items:
+        record = items[0]
+        last = {"id": record.get("id"), "label": record.get("label"),
+                "created": record.get("created"),
+                "files": len(record.get("files") or {})}
+    return {"ok": True, "count": len(items), "last": last}
+
+
+def overview():
+    """One read-only snapshot for the Command Center.
+
+    Everything is measured; a metric that cannot be measured is null instead of
+    a guess. The expensive probes (network, speech stack) come from the
+    monitor's existing snapshot, so a page refresh never re-runs them.
+    """
+    try:
+        state = monitoring.status()
+    except Exception as e:
+        log.warning("overview could not read the monitor: %s", e)
+        state = {}
+    snapshot = state.get("snapshot") or {}
+    if not snapshot.get("at"):
+        # No monitor cycle yet: one cheap sample keeps the first paint honest.
+        try:
+            snapshot = monitoring.check()
+        except Exception as e:
+            log.warning("overview could not sample the machine: %s", e)
+            snapshot = {}
+    checks = snapshot.get("checks") or {}
+    failed = [str(name) for name in (snapshot.get("failed") or [])]
+    alerts = [{"kind": a.get("kind"), "message": a.get("message")}
+              for a in (snapshot.get("alerts") or [])][:8]
+
+    cpu = checks.get("cpu") or {}
+    ram = checks.get("ram") or {}
+    disk = checks.get("disk") or {}
+    network = checks.get("network")
+
+    try:
+        history = selfheal.recent(200)
+    except Exception:
+        history = []
+    errors, repairs = [], []
+    for item in history:
+        if item.get("kind") == "repair":
+            if len(repairs) < 6:
+                repairs.append({"at": item.get("at"), "component": item.get("component"),
+                                "ok": bool(item.get("ok"))})
+        elif len(errors) < 6:
+            errors.append({"id": item.get("id"), "at": item.get("at"),
+                           "component": item.get("component"),
+                           "error": str(item.get("error") or "")[:300]})
+    error_total = len([i for i in history if i.get("kind") != "repair"])
+
+    ok = bool(snapshot.get("at")) and not failed and not alerts
+    return {
+        "at": time.time(),
+        "uptime_seconds": round(time.time() - _STARTED_AT),
+        "version": _version(),
+        "status": {"state": ("healthy" if ok else
+                              ("degraded" if snapshot.get("at") else "unknown")),
+                   "ok": ok, "failed": failed, "alerts": alerts},
+        "system": {"cpu": cpu.get("value"), "ram": ram.get("value"),
+                   "disk": disk.get("value"), "disk_free_gb": disk.get("free_gb"),
+                   "sampled_at": snapshot.get("at")},
+        "jobs": _overview_jobs(),
+        "agents": _overview_agents(),
+        "models": _overview_models(),
+        "voice": _overview_voice(checks),
+        "database": _overview_database(),
+        "network": (None if not isinstance(network, dict) else
+                    {"ok": bool(network.get("ok")), "ms": network.get("ms"),
+                     "detail": network.get("detail")}),
+        "plugins": _overview_plugins(),
+        "errors": {"count": error_total, "recent": errors},
+        "repairs": {"recent": repairs},
+        "security": _overview_security(),
+        "latency": _overview_latency(),
+        "backups": _overview_backups(),
+        "git": _git_revision(),
+        "monitor": {"running": bool(state.get("running")),
+                    "interval": state.get("interval"),
+                    "snapshot_at": snapshot.get("at")},
     }
 
 
@@ -948,6 +1368,14 @@ def install(app):
     def admin_health():
         monitoring.ensure_started()
         state = monitoring.status()
+        if not (state.get("snapshot") or {}).get("at"):
+            # First visit before the monitor's first cycle: take one cheap
+            # sample instead of reporting the machine as unknown.
+            try:
+                monitoring.check()
+            except Exception as e:
+                log.warning("health sample failed: %s", e)
+            state = monitoring.status()
         return jsonify({
             "tiles": _tile_summary(),
             "checks": (state.get("snapshot") or {}).get("checks", {}),
@@ -956,6 +1384,13 @@ def install(app):
             "unhealthy": [name for name, item in selfheal.diagnose().items()
                           if not item.get("ok")],
         })
+
+    @app.get("/api/admin/overview")
+    @admin_required
+    def admin_overview():
+        monitoring.ensure_started()
+        # Scrub the whole payload: no token, key or absolute path survives.
+        return jsonify(_scrub_tree(overview()))
 
     @app.post("/api/admin/diagnostics")
     @admin_required

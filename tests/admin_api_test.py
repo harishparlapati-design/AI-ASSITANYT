@@ -84,7 +84,8 @@ def approve(c, approval_id, value=True):
 
 
 if __name__ == "__main__":
-    from harry_core import accounts, admin, selfheal, runtime_paths
+    import harry_core
+    from harry_core import accounts, admin, adminui, selfheal, runtime_paths
 
     store = accounts.get_store()
     admin_account = store.create("admin@example.com", ADMIN_PW, "Admin")
@@ -375,6 +376,108 @@ if __name__ == "__main__":
     actions = [a.get("action") for a in admin.get_admin_store().audit_entries(100)]
     check("listing errors is audited", "errors_viewed" in actions, actions[:8])
     check("reading one error is audited", "error_viewed" in actions, actions[:8])
+
+    # =====================================================================
+    # 5. Command Center overview
+    # =====================================================================
+    ov = admin_client.get("/api/admin/overview")
+    body = ov.get_json() or {}
+    check("overview endpoint succeeds", ov.status_code == 200, body)
+    for key in ("at", "status", "system", "jobs", "agents", "models", "voice",
+                "database", "network", "plugins", "errors", "repairs",
+                "security", "latency", "backups", "git", "monitor",
+                "uptime_seconds", "version"):
+        check(f"overview includes {key}", key in body, sorted(body))
+    check("overview reports the running version",
+          body.get("version") == harry_core.__version__, body.get("version"))
+    check("overview status is a known state",
+          (body.get("status") or {}).get("state") in ("healthy", "degraded", "unknown"),
+          body.get("status"))
+    check("overview counts real jobs",
+          isinstance((body.get("jobs") or {}).get("counts"), dict), body.get("jobs"))
+    check("overview lists the registered agents",
+          len(body.get("agents") or []) >= 5, body.get("agents"))
+    check("overview reports the database as connected",
+          (body.get("database") or {}).get("ok") is True, body.get("database"))
+    check("overview counts the real accounts",
+          (body.get("database") or {}).get("accounts") == accounts.get_store().count(),
+          body.get("database"))
+    git_info = body.get("git") or {}
+    check("overview reads the git checkout", git_info.get("available") is True, git_info)
+    check("overview reports a branch and a commit",
+          bool(git_info.get("branch")) and bool(git_info.get("commit")), git_info)
+    check("overview keeps metrics numeric or null",
+          all(v is None or isinstance(v, (int, float))
+              for k, v in (body.get("system") or {}).items() if k != "sampled_at"),
+          body.get("system"))
+    check("overview surfaces recorded errors",
+          (body.get("errors") or {}).get("count", 0) >= 5, body.get("errors"))
+    check("overview surfaces recent repairs",
+          len((body.get("repairs") or {}).get("recent") or []) >= 1, body.get("repairs"))
+    check("overview reports uptime",
+          isinstance(body.get("uptime_seconds"), (int, float))
+          and body["uptime_seconds"] >= 0, body.get("uptime_seconds"))
+    check("overview lists security activity",
+          "recent" in (body.get("security") or {}), body.get("security"))
+    check("overview reports backup status",
+          "count" in (body.get("backups") or {}), body.get("backups"))
+
+    ov_raw = ov.get_data(as_text=True)
+    check("overview redacts secrets", "sk-live-ABCDEFGHIJKLMNOPQRST" not in ov_raw,
+          ov_raw[:200])
+    check("overview hides absolute paths", root not in ov_raw, ov_raw[:200])
+    check("unauthenticated overview is refused",
+          client().get("/api/admin/overview").status_code == 401)
+    check("ordinary user cannot read the overview",
+          user_client.get("/api/admin/overview").status_code == 403)
+    check("overview rejects the wrong method",
+          admin_client.post("/api/admin/overview", json={},
+                            headers=json_headers(admin_client)).status_code == 405)
+
+    # A dead monitor must degrade the snapshot, not the endpoint.
+    import harry_core.monitoring as _mon
+    real_status, real_check = _mon.status, _mon.check
+    _mon.status = lambda: {"running": False, "interval": 0, "snapshot": None}
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("probe failed")
+
+    _mon.check = _boom
+    try:
+        degraded = admin_client.get("/api/admin/overview")
+        dbody = degraded.get_json() or {}
+        check("overview survives a monitoring failure", degraded.status_code == 200, dbody)
+        check("unmeasured metrics are null, not invented",
+              (dbody.get("system") or {}).get("cpu") is None, dbody.get("system"))
+        check("a dead monitor reports an unknown state",
+              (dbody.get("status") or {}).get("state") == "unknown", dbody.get("status"))
+        check("monitoring failure is not leaked as a path",
+              root not in degraded.get_data(as_text=True))
+    finally:
+        _mon.status, _mon.check = real_status, real_check
+
+    # A broken accounts database must degrade too.
+    import harry_core.accounts as _accounts
+    real_store = _accounts.get_store
+
+    def _db_down(*_args, **_kwargs):
+        raise RuntimeError("database is locked")
+
+    # Patched at the store boundary: the hosted gate reads accounts on every
+    # request, so only the probe itself can be isolated here.
+    _accounts.get_store = _db_down
+    try:
+        report = adminui._overview_database()
+        check("a database failure is reported, not raised",
+              report.get("ok") is False, report)
+        check("an unreadable account count is null, not zero",
+              report.get("accounts") is None, report)
+        check("the database error is scrubbed",
+              "database is locked" in str(report.get("error")), report)
+    finally:
+        _accounts.get_store = real_store
+    check("the endpoint recovers once the database is back",
+          admin_client.get("/api/admin/overview").status_code == 200)
 
     print(f"\n===== RESULT: {PASS} passed, {FAIL} failed =====")
     sys.exit(1 if FAIL else 0)
