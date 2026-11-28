@@ -121,7 +121,28 @@ PAGE = r"""<!doctype html>
       </div>
       <div class="card"><h2>Component health</h2><div id="health"></div></div>
       <div class="card" style="margin-top:14px"><h2>Alerts</h2><div id="alerts"></div></div>
-      <div class="card" style="margin-top:14px"><h2>Error reports</h2><div id="errors"></div></div>
+      <div class="card" style="margin-top:14px"><h2>Error reports</h2>
+        <div class="row" style="margin-bottom:10px">
+          <select id="errKind" style="max-width:170px" onchange="filterErrors(this.value)">
+            <option value="">All kinds</option>
+            <option value="error">Errors</option>
+            <option value="repair">Repairs</option>
+          </select>
+          <span class="muted" id="errRange"></span>
+          <span style="flex:1"></span>
+          <button id="errPrev" onclick="errorsPage(-1)">Previous</button>
+          <button id="errNext" onclick="errorsPage(1)">Next</button>
+          <button onclick="loadErrors()">Refresh</button>
+        </div>
+        <div id="errors"></div>
+        <div id="errDetailBox" hidden style="margin-top:14px;padding-top:12px;border-top:1px solid var(--line)">
+          <div class="row" style="justify-content:space-between;margin-bottom:8px">
+            <h2 style="margin:0">Report detail</h2>
+            <button onclick="closeErrorDetail()">Close</button></div>
+          <pre id="errDetail"></pre>
+        </div>
+        <div style="margin-top:16px"><h2>Failed jobs</h2><div id="errJobs"></div></div>
+      </div>
       <div class="card" style="margin-top:14px"><h2>Diagnostic output</h2><pre id="diag"></pre></div>
     </section>
 
@@ -181,6 +202,21 @@ PAGE = r"""<!doctype html>
       </div>
       <div class="card" style="margin-top:14px"><h2>Accounts and roles</h2>
         <div id="users"></div>
+        <div id="userMsg" hidden></div>
+        <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--line)">
+          <h2 style="margin-top:0">Create an account</h2>
+          <p class="muted">New accounts always start as users. Promotion and deletion need an
+            approval record; deactivation takes effect immediately and revokes sessions.</p>
+          <label for="newEmail">Email</label>
+          <input id="newEmail" type="email" autocomplete="off" placeholder="person@example.com">
+          <label for="newName">Name (optional)</label>
+          <input id="newName" autocomplete="off">
+          <label for="newPw">Password (12+ characters)</label>
+          <input id="newPw" type="password" autocomplete="new-password">
+          <div class="err" id="userErr" hidden></div>
+          <div class="row" style="margin-top:12px">
+            <button class="primary" onclick="createUser()">Create account</button></div>
+        </div>
       </div>
       <div class="card" style="margin-top:14px"><h2>Policy</h2>
         <p class="muted">Security, authentication and permission changes are never applied
@@ -406,40 +442,130 @@ async function revoke(id){
   loadSessions();checkSession();
 }
 
-async function loadErrors(){
+let ERR_OFFSET=0, ERR_LIMIT=10, ERR_KIND='';
+
+async function loadErrors(offset=ERR_OFFSET){
+  ERR_OFFSET=Math.max(0,offset);
   try{
-    const r=await api('/api/admin/errors');
-    const rows=(r.history||[]).filter(h=>h.kind==='error'||h.kind==='repair').slice(0,12);
-    const jobs=(r.failed_jobs||[]).slice(0,6);
-    $('errors').innerHTML=(rows.length||jobs.length)?`<table><tr><th>When</th><th>Source</th><th>Detail</th></tr>${
-      rows.map(h=>`<tr><td class="muted">${new Date(h.at*1000).toLocaleString()}</td>
-      <td>${esc(h.component||h.kind)}</td><td class="muted">${esc((h.error||(h.result&&JSON.stringify(h.result))||'').toString().slice(0,140))}</td></tr>`).join('')
-      +jobs.map(j=>`<tr><td class="muted">${new Date((j.created||0)*1000).toLocaleString()}</td>
-      <td>job: ${esc(j.label||j.kind)}</td><td class="muted">${esc((j.error||'').slice(0,140))}</td></tr>`).join('')}</table>`
+    const q=`/api/admin/errors?limit=${ERR_LIMIT}&offset=${ERR_OFFSET}`
+      +(ERR_KIND?`&kind=${encodeURIComponent(ERR_KIND)}`:'');
+    const r=await api(q);
+    const rows=r.history||[];
+    $('errors').innerHTML=rows.length?`<table><tr><th>When</th><th>Kind</th><th>Source</th><th>Detail</th><th></th></tr>${
+      rows.map(h=>`<tr><td class="muted">${h.at?new Date(h.at*1000).toLocaleString():'-'}</td>
+      <td class="muted">${esc(h.kind||'')}</td><td>${esc(h.component||'-')}</td>
+      <td class="muted">${esc((h.error||(h.result&&JSON.stringify(h.result))||'').toString().slice(0,140))}</td>
+      <td>${h.id?`<button onclick="showErrorDetail('${esc(h.id)}')">View</button>`:'<span class="muted">no id</span>'}</td></tr>`).join('')}</table>`
       :'<p class="muted">No errors recorded.</p>';
+    const total=r.total||0, start=r.offset||0;
+    ERR_OFFSET=start;
+    $('errRange').textContent=total?`${start+1}\u2013${start+rows.length} of ${total}`:'0 of 0';
+    $('errPrev').disabled=!(start>0);
+    $('errNext').disabled=r.next_offset==null;
+    const jobs=r.failed_jobs||[];
+    $('errJobs').innerHTML=jobs.length?`<table><tr><th>When</th><th>Job</th><th>Error</th></tr>${
+      jobs.slice(0,6).map(j=>`<tr><td class="muted">${new Date((j.created||0)*1000).toLocaleString()}</td>
+      <td>${esc(j.label||j.kind)}</td><td class="muted">${esc((j.error||'').slice(0,140))}</td></tr>`).join('')}</table>`
+      :'<p class="muted">No failed jobs.</p>';
   }catch(e){$('errors').innerHTML=`<div class="err">${esc(e.message)}</div>`;}
 }
+function errorsPage(dir){loadErrors(ERR_OFFSET+dir*ERR_LIMIT);}
+function filterErrors(kind){ERR_KIND=kind||'';loadErrors(0);}
+async function showErrorDetail(id){
+  try{
+    const r=await api('/api/admin/errors/'+encodeURIComponent(id));
+    $('errDetailBox').hidden=false;
+    $('errDetail').textContent=JSON.stringify(r.item,null,2);
+  }catch(e){
+    $('errDetailBox').hidden=false;
+    $('errDetail').textContent='could not load this report: '+e.message;
+  }
+}
+function closeErrorDetail(){$('errDetailBox').hidden=true;$('errDetail').textContent='';}
 
+let EDITUSER=null;
+function userMsg(text, bad){
+  const el=$('userMsg');
+  if(!el)return;
+  el.hidden=!text;el.textContent=text||'';
+  el.className=bad?'err':'muted';
+}
+function pendingMsg(r, action){
+  userMsg(action+' needs an approval record. Approve '+(r.approval||'it')
+    +' in the Approvals tab, then repeat the action.',true);
+  loadApprovals();
+}
 async function loadUsers(){
   try{
-    const r=await api('/api/admin/users');
-    $('users').innerHTML=`<table><tr><th>Account</th><th>Role</th><th></th></tr>${
-      r.items.map(u=>`<tr><td>${esc(u.email)}<div class="muted">${esc(u.id)}</div></td>
+    const items=(await api('/api/admin/users')).items||[];
+    $('users').innerHTML=items.length?`<table><tr><th>Account</th><th>Role</th><th>State</th><th>Actions</th></tr>${
+      items.map(u=>`<tr><td>${esc(u.name||u.email)}
+        <div class="muted">${esc(u.email)} \u00b7 ${esc(u.id)}</div></td>
       <td class="${u.administrator?'ok':'muted'}">${esc(u.role)}</td>
-      <td>${u.administrator?'':`<button onclick="setRole('${esc(u.id)}','admin')">Make administrator</button>`}
-      ${u.administrator?`<button onclick="setRole('${esc(u.id)}','user')">Remove administrator</button>`:''}</td></tr>`).join('')}</table>`;
+      <td class="${u.active?'ok':'warn'}">${u.active?'active':'deactivated'}</td>
+      <td>${userActions(u)}</td></tr>`).join('')}</table>`
+      :'<p class="muted">No accounts.</p>';
   }catch(e){$('users').innerHTML=`<div class="err">${esc(e.message)}</div>`;}
+}
+function userActions(u){
+  if(EDITUSER===u.id){
+    return `<div class="row"><input id="renameInput" style="max-width:180px" value="${esc(u.name||'')}"
+      placeholder="Name"><button class="primary" onclick="saveRename('${esc(u.id)}')">Save</button>
+      <button onclick="editUser(null)">Cancel</button></div>`;
+  }
+  return [
+    `<button onclick="editUser('${esc(u.id)}')">Rename</button>`,
+    u.administrator
+      ? `<button onclick="setRole('${esc(u.id)}','user')">Remove administrator</button>`
+      : `<button onclick="setRole('${esc(u.id)}','admin')">Make administrator</button>`,
+    u.active
+      ? `<button class="danger" onclick="setActive('${esc(u.id)}',false)">Deactivate</button>`
+      : `<button class="primary" onclick="setActive('${esc(u.id)}',true)">Activate</button>`,
+    `<button class="danger" onclick="deleteUser('${esc(u.id)}')">Delete</button>`
+  ].join(' ');
+}
+function editUser(id){EDITUSER=id||null;loadUsers();}
+async function saveRename(id){
+  const field=$('renameInput');
+  try{
+    await api('/api/admin/users/'+encodeURIComponent(id),{method:'PATCH',
+      body:{name:field?field.value:''}});
+    EDITUSER=null;userMsg('Name updated.');
+  }catch(e){userMsg(e.message,true);}
+  loadUsers();
+}
+async function setActive(id, active){
+  try{
+    const r=await api('/api/admin/users/'+encodeURIComponent(id),{method:'PATCH',body:{active}});
+    userMsg(active?'Account activated.'
+      :`Account deactivated${r.sessions_revoked?`; ${r.sessions_revoked} session(s) revoked`:''}.`);
+  }catch(e){userMsg(e.message,true);}
+  loadUsers();
+}
+async function deleteUser(id){
+  try{
+    const r=await api('/api/admin/users/'+encodeURIComponent(id),{method:'DELETE',body:{}});
+    if(r.status==='pending')pendingMsg(r,'Deleting an account');
+    else userMsg('Account '+(r.deleted||id)+' deleted.');
+  }catch(e){userMsg(e.message,true);}
+  loadUsers();
+}
+async function createUser(){
+  showError('userErr','');userMsg('');
+  try{
+    const r=await api('/api/admin/users',{method:'POST',body:{email:$('newEmail').value,
+      name:$('newName').value,password:$('newPw').value}});
+    $('newEmail').value='';$('newName').value='';$('newPw').value='';
+    userMsg('Created '+r.email+' as '+r.role+'.');
+  }catch(e){showError('userErr',e.message);}
+  loadUsers();
 }
 async function setRole(id, role){
   try{
-    await api('/api/admin/users/'+encodeURIComponent(id)+'/role',{method:'POST',body:{role}});
-    alert('Role changed.');
-  }catch(e){
-    if(e.data&&e.data.approval){
-      alert('Approval required. Approve '+e.data.approval+' in the Approvals tab, then press the same button again.');
-      loadApprovals();
-    } else { alert(e.message); }
-  }
+    const r=await api('/api/admin/users/'+encodeURIComponent(id)+'/role',{method:'POST',body:{role}});
+    if(r.status==='pending')pendingMsg(r,'A role change');
+    else userMsg('Role changed to '+role+'.');
+  }catch(e){userMsg(e.message,true);}
   loadUsers();
 }
 
