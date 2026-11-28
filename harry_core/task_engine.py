@@ -52,13 +52,17 @@ _FOLLOWUP = re.compile(
 
 
 class Task:
-    def __init__(self, title, description="", task_id=None, request_id=None):
+    def __init__(self, title, description="", task_id=None, request_id=None,
+                 understanding=None):
         # The millisecond stamp plus a uuid suffix guarantees unique ids even
         # when two tasks are created inside the same millisecond.
         self.id = task_id or f"task_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
         self.request_id = request_id      # idempotency key from the client
         self.title = title
         self.description = description
+        # What the Core Brain understood about this request (intent, human
+        # signals, entities). Used for prompt guidance and the decision record.
+        self.understanding = understanding or {}
         self.status = NEW
         self.kind = "question"            # question | task (decided in UNDERSTANDING)
         self.goal = ""                    # short restatement (display only)
@@ -115,7 +119,8 @@ class TaskEngine:
 
     # -- CRUD --------------------------------------------------------------
 
-    def create_task(self, title, description="", request_id=None):
+    def create_task(self, title, description="", request_id=None,
+                    understanding=None):
         """Create a task. A repeated ``request_id`` returns the first task.
 
         The request id comes from the client, so a resubmitted request (double
@@ -128,7 +133,8 @@ class TaskEngine:
                         log.info("task %s reused for request %s",
                                  existing.id, request_id)
                         return existing.to_dict()
-            task = Task(title, description, request_id=request_id)
+            task = Task(title, description, request_id=request_id,
+                        understanding=understanding)
             self.tasks[task.id] = task
             self._save()
         events.emit("task_created", {"id": task.id, "title": title})
@@ -636,6 +642,14 @@ Respond JSON: {{"analysis": "...", "strategy": "retry" | "alternative",
         if memory_hits != "none":
             messages.append({"role": "system",
                              "content": f"Relevant memories: {memory_hits}"})
+        # Human-aware guidance (tone, detail level, evidence rules) computed by
+        # the Core Brain for this exact request.
+        from . import communication
+        guide = communication.prompt_guidance(
+            (task.understanding or {}).get("human"),
+            (task.understanding or {}).get("intent"))
+        if guide:
+            messages.append({"role": "system", "content": guide})
         # Only complete user->assistant pairs become context. Trailing
         # unanswered turns (a crashed request, a bare tool output) used to be
         # fed to the model, which then tried to answer several old questions

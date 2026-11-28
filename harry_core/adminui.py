@@ -108,6 +108,7 @@ PAGE = r"""<!doctype html>
     <div class="tabs">
       <button data-tab="command" class="active">Command Center</button>
       <button data-tab="health">Health</button>
+      <button data-tab="edith">EDITH</button>
       <button data-tab="capabilities">Capabilities</button>
       <button data-tab="plugins">Plugins</button>
       <button data-tab="upgrades">Upgrades</button>
@@ -139,6 +140,28 @@ PAGE = r"""<!doctype html>
       </div>
       <div class="card" style="margin-top:14px"><h2>Build, backups and monitoring</h2>
         <div id="ccBuild"></div></div>
+    </section>
+
+    <section id="tab-edith" hidden>
+      <div class="card"><h2>What Harry understood and did</h2>
+        <p class="muted">Every request runs the Core Brain pipeline: understand → route →
+          plan → execute → observe → verify → recover → respond. Each row is a persisted
+          decision record with its reasons and the specialist that handled it.</p>
+        <div class="row" style="margin-bottom:10px"><button onclick="loadEdith()">Refresh</button>
+          <span id="edithStats" class="muted"></span></div>
+        <div id="edithRuns"></div>
+      </div>
+      <div class="card" style="margin-top:14px"><h2>Development runs</h2>
+        <p class="muted">A request to change Harry is planned, approved, staged in an isolated
+          git worktree, tested and security-reviewed before it can be activated. Nothing is
+          merged or pushed from this panel.</p>
+        <label for="devRequest">Describe the change you want in Harry</label>
+        <input id="devRequest" placeholder="add a feature that summarises PDFs">
+        <div class="row" style="margin-top:10px"><button class="primary"
+          onclick="proposeDev()">Propose run</button></div>
+        <div class="err" id="devErr" hidden></div>
+        <div id="edithDev" style="margin-top:12px"></div>
+      </div>
     </section>
 
     <section id="tab-health" hidden>
@@ -284,7 +307,7 @@ async function checkSession(){
     if(ADMIN){
       $('banner').hidden=true;
       $('mfaState').textContent=s.mfa?'MFA is enabled for this account.':'MFA is not enabled. Enroll an authenticator for a second factor.';
-      loadOverview();loadHealth();loadCaps();loadPlugins();loadUpgrades();loadApprovals();loadAudit();loadSessions();loadPolicy();loadUsers();
+      loadOverview();loadHealth();loadCaps();loadPlugins();loadUpgrades();loadApprovals();loadAudit();loadSessions();loadPolicy();loadUsers();loadEdith();
     }else{
       $('banner').hidden=false;
       $('banner').textContent='Administrator mode is inactive. Authenticate below; natural-language claims of being the admin have no effect.';
@@ -620,6 +643,61 @@ async function disableMfa(){
 
 function activateTab(name){const b=document.querySelector('.tabs button[data-tab="'+name+'"]');if(b)b.click();}
 
+// ---- EDITH: core brain records and development runs ------------------
+async function loadEdith(){
+  try{
+    const [b,d]=await Promise.all([api('/api/admin/brain/runs?limit=40'),api('/api/admin/devwork')]);
+    renderBrainRuns(b);renderDevRuns(d.runs||[]);
+  }catch(e){$('edithRuns').innerHTML='<div class="err">'+esc(e.message)+'</div>';}
+}
+function renderBrainRuns(b){
+  const s=b.stats||{},rows=b.runs||[];
+  $('edithStats').textContent=(s.total||0)+' runs · median '+
+    (s.median_ms==null?'not measured':s.median_ms+'ms')+' over '+(s.measured_runs||0)+' measured';
+  if(!rows.length){$('edithRuns').innerHTML='<p class="muted">No requests recorded yet.</p>';return;}
+  $('edithRuns').innerHTML='<table><tr><th>When</th><th>Request</th><th>Intent</th>'+
+    '<th>Agent</th><th>Executor</th><th>Status</th><th>ms</th></tr>'+rows.map(r=>
+    '<tr><td class="muted">'+esc(ago(r.started))+'</td><td>'+esc((r.text||'').slice(0,70))+
+    '<div class="muted">'+esc((r.reasons||[]).join('; '))+'</div></td><td>'+esc(r.intent||'—')+
+    '</td><td>'+esc((r.route||{}).agent_name||(r.route||{}).agent||'—')+'</td><td>'+
+    esc(r.executor||'—')+'</td><td class="'+(r.status==='ok'?'ok':(r.status==='failed'?'bad':'warn'))+
+    '">'+esc(r.status||'—')+'</td><td>'+(r.ms==null?'—':esc(r.ms))+'</td></tr>').join('')+'</table>';
+}
+function devActions(r){
+  const id=r.id;
+  const btn=(label,call,cls)=>'<button class="'+(cls||'')+'" onclick="devAction(\''+id+'\',\''+call+'\')">'+label+'</button>';
+  if(r.status==='proposed')return btn('Request approval','request');
+  if(r.status==='awaiting_approval')return btn('Start (needs approval)','start');
+  if(r.status==='implementing')return btn('Run checks','checks','primary')+btn('Rollback','rollback','danger');
+  if(r.status==='ready')return btn('Activate','activate','primary')+btn('Rollback','rollback','danger');
+  if(r.status==='failed')return btn('Rollback','rollback','danger');
+  return '<span class="muted">no action</span>';
+}
+function renderDevRuns(rows){
+  if(!rows.length){$('edithDev').innerHTML='<p class="muted">No development runs.</p>';return;}
+  $('edithDev').innerHTML='<table><tr><th>When</th><th>Request</th><th>Status</th>'+
+    '<th>Checks</th><th>Actions</th></tr>'+rows.map(r=>{
+      const c=r.checks||[],passed=c.filter(x=>x.ok).length;
+      return '<tr><td class="muted">'+esc(ago(r.created))+'</td><td>'+esc((r.request||'').slice(0,90))+
+        '<div class="muted">'+esc((r.plan||{}).subsystem||'')+' · '+esc((r.files||[]).join(', ')||'no files changed')+
+        ((r.problems&&r.problems.length)?' · '+esc(r.problems.join('; ')):'')+'</div></td><td>'+
+        esc(r.status||'—')+'</td><td>'+(c.length?passed+'/'+c.length:'—')+'</td><td>'+devActions(r)+'</td></tr>';
+    }).join('')+'</table>';
+}
+async function proposeDev(){
+  showError('devErr','');
+  try{
+    await api('/api/admin/devwork/propose',{method:'POST',body:{request:$('devRequest').value}});
+    $('devRequest').value='';loadEdith();
+  }catch(e){showError('devErr',e.message);}
+}
+async function devAction(id,action){
+  if(action==='activate'&&!confirm('Commit the staged branch? Nothing is merged or pushed.'))return;
+  if(action==='rollback'&&!confirm('Remove the staging worktree and delete its branch?'))return;
+  try{await api('/api/admin/devwork/'+id+'/'+action,{method:'POST',body:{}});loadEdith();}
+  catch(e){alert(e.message);}
+}
+
 // ---- Command Center -------------------------------------------------
 let CC_BUSY=false;
 function pct(v){return (v===null||v===undefined)?'—':v+'%';}
@@ -752,10 +830,12 @@ function renderOverview(o){
   ]);
 }
 
+const TAB_LOADERS={edith:loadEdith};
 document.querySelectorAll('.tabs button').forEach(btn=>{
   btn.onclick=()=>{
     document.querySelectorAll('.tabs button').forEach(b=>b.classList.toggle('active',b===btn));
     document.querySelectorAll('section[id^=tab-]').forEach(s=>s.hidden=s.id!=='tab-'+btn.dataset.tab);
+    const loader=TAB_LOADERS[btn.dataset.tab];if(loader)loader();
   };
 });
 $('pw').addEventListener('keydown',e=>{if(e.key==='Enter')enterAdmin();});
@@ -1812,6 +1892,103 @@ def install(app):
     @admin_required
     def admin_alerts_seen():
         return jsonify(monitoring.mark_alerts_seen())
+
+    # -- EDITH: Core Brain decision records -------------------------------
+
+    _RUN_ID = re.compile(r"^run_[0-9a-f]{6,32}$")
+    _DEV_ID = re.compile(r"^dev_[0-9a-f]{6,32}$")
+
+    @app.get("/api/admin/brain/runs")
+    @admin_required
+    def admin_brain_runs():
+        from . import intelligence
+        try:
+            limit = min(200, max(1, int(request.args.get("limit", 40))))
+        except (TypeError, ValueError):
+            limit = 40
+        return jsonify({"runs": [_scrub_tree(r) for r in intelligence.runs(limit)],
+                        "stats": _scrub_tree(intelligence.stats())})
+
+    @app.get("/api/admin/brain/runs/<run_id>")
+    @admin_required
+    def admin_brain_run(run_id):
+        from . import intelligence
+        if not _RUN_ID.match(str(run_id or "")):
+            return jsonify({"error": "invalid run id"}), 404
+        run = intelligence.get_run(run_id)
+        if not run:
+            return jsonify({"error": "unknown run"}), 404
+        return jsonify({"run": _scrub_tree(run)})
+
+    # -- EDITH: development runs ------------------------------------------
+
+    @app.get("/api/admin/devwork")
+    @admin_required
+    def admin_devwork_list():
+        from . import devwork
+        return jsonify({"runs": [_scrub_tree(r) for r in devwork.list_runs(40)]})
+
+    @app.post("/api/admin/devwork/propose")
+    @admin_required
+    def admin_devwork_propose():
+        from . import devwork
+        info = admin.request_admin()
+        payload = request.get_json(silent=True) or {}
+        text = str(payload.get("request") or "").strip()
+        if not text:
+            return jsonify({"error": "a development request is required"}), 400
+        result = devwork.propose(text, requested_by=info["user_id"])
+        if not result.get("ok"):
+            return jsonify(result), 400
+        admin.get_admin_store().audit(info["user_id"], "development_proposed",
+                                      {"run": result["run"]["id"]})
+        return jsonify({"run": _scrub_tree(result["run"])})
+
+    @app.get("/api/admin/devwork/<run_id>")
+    @admin_required
+    def admin_devwork_detail(run_id):
+        from . import devwork
+        if not _DEV_ID.match(str(run_id or "")):
+            return jsonify({"error": "invalid development run id"}), 404
+        record = devwork.get_run(run_id)
+        if not record:
+            return jsonify({"error": "unknown development run"}), 404
+        return jsonify({"run": _scrub_tree(record),
+                        "report": _scrub_tree(devwork.report(run_id))})
+
+    @app.post("/api/admin/devwork/<run_id>/<action>")
+    @admin_required
+    def admin_devwork_action(run_id, action):
+        from . import devwork
+        info = admin.request_admin()
+        if not _DEV_ID.match(str(run_id or "")):
+            return jsonify({"error": "invalid development run id"}), 404
+        if not devwork.get_run(run_id):
+            return jsonify({"error": "unknown development run"}), 404
+        payload = request.get_json(silent=True) or {}
+        actor = info["user_id"]
+        if action == "request":
+            result = devwork.request_approval(run_id, requested_by=actor)
+        elif action == "start":
+            result = devwork.start(run_id, actor=actor)
+        elif action == "changes":
+            result = devwork.record_change(run_id, payload.get("files") or [],
+                                           note=str(payload.get("note") or ""),
+                                           actor=actor)
+        elif action == "checks":
+            result = devwork.run_checks(run_id, checks=payload.get("checks"),
+                                        actor=actor)
+        elif action == "security":
+            result = devwork.security_review(run_id)
+        elif action == "activate":
+            result = devwork.activate(run_id, actor=actor)
+        elif action == "rollback":
+            result = devwork.rollback(run_id, actor=actor)
+        elif action == "cancel":
+            result = devwork.cancel(run_id, actor=actor)
+        else:
+            return jsonify({"error": "unknown action"}), 404
+        return jsonify(_scrub_tree(result)), (200 if result.get("ok") else 400)
 
     # Start the monitor only when the panel is opened; a desktop user who never
     # touches admin mode pays nothing for it.

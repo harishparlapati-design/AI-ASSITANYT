@@ -349,13 +349,36 @@ class Brain:
                                      "request_id": rid})
         low = text.lower()
 
+        # ---- Core Brain: understand, route, open a decision record ----
+        # Deterministic regex work only, so it costs no model round-trip. The
+        # record (intent, reasons, chosen specialist, usable tools) is what
+        # EDITH shows; it never contains private chain-of-thought.
+        from . import communication, intelligence
+        understanding, routing, pipeline_run = None, None, None
+        try:
+            understanding = intelligence.understand(text, source=source)
+            routing = intelligence.route(understanding)
+            pipeline_run = intelligence.start_run(understanding, routing, source)
+            intelligence.add_stage(pipeline_run, "route", routing.get("why"))
+        except Exception as e:      # the pipeline must never block a reply
+            log.warning("core brain unavailable: %s", e)
+        human = (understanding or {}).get("human") or {}
+        guidance = (intelligence.instructions(understanding, routing)
+                    if understanding else "")
+
         stream = None
 
-        def finish(answer):
+        def finish(answer, executor="pipeline", status="ok"):
             # Record the answer for EVERY path (fast path, memory command, tool
             # task, model answer). Without this the history accumulated several
             # unanswered user turns and the model tried to answer all of them.
-            self.memory.conversation.add("assistant", str(answer),
+            answer = str(answer)
+            # Human-aware shaping. A streamed answer may already be partly
+            # spoken, and reshaping it then would desync the audio from the text.
+            if stream is None or getattr(stream, "spoken", 0) == 0:
+                answer = communication.shape_answer(
+                    answer, human, (understanding or {}).get("intent"))
+            self.memory.conversation.add("assistant", answer,
                                          meta={"request_id": rid})
             speech_rest = stream.remainder() if stream is not None else None
             self.say(answer, request_id=rid, wait=wait_speech,
@@ -363,6 +386,14 @@ class Brain:
                      speech_text=speech_rest)
             trace.mark("delivered")
             trace.finish()
+            if pipeline_run:
+                try:
+                    intelligence.finish_run(
+                        pipeline_run, status=status, executor=executor,
+                        answer=answer,
+                        ms=(time.perf_counter() - t_start) * 1000)
+                except Exception as e:
+                    log.debug("run record not saved: %s", e)
             log.info("[%s] answered in %.0fms", rid,
                      (time.perf_counter() - t_start) * 1000)
             return answer
@@ -372,12 +403,12 @@ class Brain:
             events.emergency_stop("user requested emergency stop")
             self.stop()
             answer = "Emergency stop. All operations halted."
-            return finish(answer)
+            return finish(answer, "control")
         if re.search(r"^\s*(harry[, ]*)?(stop|cancel|abort)\b", low) and self.busy:
             events.emergency_stop("user cancelled current work")
-            return finish("Stopped.")
+            return finish("Stopped.", "control")
         if re.search(r"\b(what are you doing|status)\b", low) and self.busy:
-            return finish(self._status_report())
+            return finish(self._status_report(), "status")
 
         # ---- administrator commands ----
         # Recognition is deterministic, and the *verified* elevation from the web
@@ -385,7 +416,33 @@ class Brain:
         from . import admin_commands
         admin_reply = admin_commands.handle(text)
         if admin_reply is not None:
-            return finish(admin_reply)
+            return finish(admin_reply, "admin_command")
+
+        # ---- conversational self-development ----
+        # A request to change Harry becomes a tracked development run with an
+        # approval gate; nothing in the running checkout is touched here.
+        if understanding and understanding.get("intent") == intelligence.DEVELOPMENT:
+            from . import devwork
+            actor = None
+            try:
+                from . import admin
+                actor = (admin.request_admin() or {}).get("user_id")
+            except Exception:
+                actor = None
+            proposed = devwork.propose(text, requested_by=actor)
+            if proposed.get("ok"):
+                record = proposed["run"]
+                answer = devwork.summary_for_chat(record, human)
+                if pipeline_run:
+                    intelligence.add_stage(pipeline_run, "plan",
+                                           f"development run {record['id']}")
+                events.emit("development_proposed",
+                            {"run_id": record["id"],
+                             "status": record["status"]})
+            else:
+                answer = ("I could not open a development run: "
+                          + str(proposed.get("error") or "unknown error"))
+            return finish(answer, "devwork")
 
         # ---- deterministic fast paths (never touch the model) ----
         fast = self._fast_reply(text, low)
@@ -395,18 +452,18 @@ class Brain:
             fast = general_fast_reply(fast, text, preference)
             timing.mark("fast_path")
             log.info("[%s] fast path", rid)
-            return finish(fast)
+            return finish(fast, "fast_path")
 
         # ---- memory commands ----
         response = self._memory_commands(low, text)
         if response is not None:
-            return finish(response)
+            return finish(response, "memory")
 
         # ---- system check ----
         if re.search(r"\b(system check|diagnostics|health check)\b", low):
             from .diagnostics import run_diagnostics
             report = run_diagnostics()
-            return finish(report)
+            return finish(report, "diagnostics")
 
         # ---- task / question pipeline ----
         # Speech starts as soon as the first sentence exists instead of after
@@ -417,20 +474,37 @@ class Brain:
         self.busy = True
         try:
             try:
-                task = self.engine.create_task(text, request_id=rid)
+                task = self.engine.create_task(text, request_id=rid,
+                                               understanding=understanding)
                 timing.mark("task_created")
                 log.info("[%s] task %s created", rid, task["id"])
                 result = self.engine.run_task(
                     task["id"], on_delta=self._delta_handler(rid, stream))
             except events.EmergencyStop:
                 answer = "Okay, stopped that for you."
-                return finish(answer)
+                return finish(answer, "control", "cancelled")
             answer = result.get("answer") or result.get("result") \
                 or self._summarize_result(result)
+            # ---- observe / verify / recover evidence ----
+            if pipeline_run:
+                steps = result.get("steps") or []
+                intelligence.add_stage(pipeline_run, "execute",
+                                       f"{len(steps)} step(s)")
+                for step in steps[:6]:
+                    intelligence.add_evidence(pipeline_run, {
+                        "step": str(step.get("description"))[:120],
+                        "status": step.get("status"),
+                        "result": str(step.get("result"))[:200]})
+                intelligence.add_stage(pipeline_run, "verify",
+                                       result.get("status"))
             if result.get("status") == "FAILED":
+                if pipeline_run:
+                    intelligence.add_stage(pipeline_run, "recover",
+                                           str(result.get("error"))[:160])
                 answer = (f"I couldn't complete that. {result.get('error') or ''} "
                           "You can ask me to try again.").strip()
-            return finish(answer)
+                return finish(answer, "task_engine", "failed")
+            return finish(answer, "task_engine")
         finally:
             self.busy = False
             events.clear_stop()
