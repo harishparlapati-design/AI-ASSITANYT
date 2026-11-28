@@ -106,6 +106,22 @@ _UNSAFE = re.compile(
     r"\b(?:read|access|monitor|record|track)\b",
     re.IGNORECASE,
 )
+# A security word is only a refusal when the target is this installation or
+# somebody else's data. Editing the user's own form, schema or page is ordinary
+# work, so an explicit artifact plus an edit verb clears the rule.
+_USER_ARTIFACT = re.compile(
+    r"\b(?:my|our|the user'?s|this)\s+(?:own\s+)?(?:form|website|site|web ?app|"
+    r"app|application|page|html|template|component|project|repo(?:sitory)?|"
+    r"codebase|code|api|schema|database|spreadsheet|document|resume|portfolio|"
+    r"prototype|mockup|landing page|checkout|signup|login page|css|frontend|"
+    r"backend|table|collection|migration)\b",
+    re.IGNORECASE,
+)
+_EDIT_VERB = re.compile(
+    r"\b(?:remove|delete|rename|add|create|change|edit|update|replace|redesign|"
+    r"refactor|fix|build|implement|hide|show|move|strip|drop|style|restyle)\b",
+    re.IGNORECASE,
+)
 _ADMIN_ACTION = re.compile(
     r"\b(?:create (?:a )?new admin\w*|make me (?:the )?admin|change (?:the )?role|"
     r"grant (?:me |them )?(?:admin|administrator|access)|promote (?:me|this account)|"
@@ -281,6 +297,22 @@ def development_request(text):
             "explicit": explicit}
 
 
+def unsafe_request(text):
+    """True when the request targets a security control or someone's secrets.
+
+    Legitimate engineering work sometimes mentions a password: removing a field
+    from the user's own form, hiding an input in their app, dropping a column
+    from their schema. Those name an artifact the user owns and an edit verb, so
+    they are ordinary work rather than a refusal.
+    """
+    text = str(text or "")
+    if not _UNSAFE.search(text):
+        return False
+    if _USER_ARTIFACT.search(text) and _EDIT_VERB.search(text):
+        return False
+    return True
+
+
 def _entities(text):
     return {
         "files": sorted(set(_ARTIFACT_WORD.findall(text)))[:8],
@@ -316,7 +348,7 @@ def understand(text, source="text", preferred_verbosity=None):
         intent = CONTROL
         reasons.append("control verb (stop/cancel/emergency)")
         confidence = 0.95
-    elif _UNSAFE.search(stripped):
+    elif unsafe_request(stripped):
         intent = UNSAFE
         reasons.append("the request would weaken a security control or target "
                        "someone else's credentials")
