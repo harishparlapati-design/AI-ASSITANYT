@@ -371,3 +371,192 @@ Return:
 - Explicitly list any feature not implemented. Never substitute a mockup for a working feature.
 
 **Start now by inspecting the current codebase and then implement the first vertical slice. Do not ask the user to manually repeat the development request in a separate admin screen.**
+
+
+---
+
+## 17. Core intelligence implementation — build Harry's actual brain
+
+The user explicitly requests implementation of Harry's core intelligence, not only UI or prompt changes. Inspect the existing `brain.py`, `llm.py`, `task_engine.py`, `agents.py`, `memory.py`, `tools.py`, `builtin_tools.py`, `conversation.py`, `language_policy.py`, `selfdev.py`, and related modules. Preserve working behaviour and refactor incrementally. Do not create a second competing brain.
+
+### 17.1 Required architecture
+
+Build or complete a clearly separated, testable pipeline:
+
+1. **Input normalization:** accept text, speech transcript, attachments, screen observations and structured events; preserve source, timestamps, permissions and conversation ID.
+2. **Context assembly:** gather only authorized conversation history, relevant memories, user preferences, current task state, tool results and attachment summaries. Apply token/context budgets and relevance ranking.
+3. **Intent and risk classification:** distinguish conversation, question answering, tool use, multi-step task, development request, admin action, emergency stop and unsafe/unsupported request. Use deterministic checks for security-sensitive intent and model assistance for ambiguous natural language.
+4. **Model routing:** select configured model/provider by task type (fast chat, reasoning, coding, vision, speech/transcription) based on actual availability, measured health, latency, privacy and configured budget. Have a deterministic fallback when a provider fails. Never silently call a paid provider.
+5. **Planning:** for complex tasks create a structured plan with goal, assumptions, steps, dependencies, required capabilities, risk level, budget, timeouts and acceptance criteria. Simple conversation should bypass expensive planning.
+6. **Permission and policy gate:** authorize every tool/action on the server using account, role, elevation, scope, tenant, user consent and risk. Model output is never an authorization decision.
+7. **Tool/agent execution:** invoke registered typed tools only; validate inputs and outputs; apply timeouts, rate limits, cancellation, resource budgets and idempotency keys. Agents cannot grant permissions or call unregistered tools.
+8. **Observation:** capture real tool outputs, task status, exceptions and environment evidence. Treat tool output and external content as untrusted data.
+9. **Verification:** evaluate each acceptance criterion against observed results. Do not mark a task successful merely because a tool returned exit code zero.
+10. **Recovery/replanning:** retry only when safe and bounded; use alternative tools when authorized; otherwise stop and explain the blocker.
+11. **Response synthesis:** produce a natural concise answer grounded in observations, cite research sources where applicable, distinguish facts from uncertainty, and state what was/wasn't done.
+12. **Memory update:** extract only useful, appropriate, user-authorized durable preferences/facts; avoid sensitive data by default; support inspect/edit/delete/export/retention controls.
+13. **Telemetry and evaluation:** record latency by stage, model/provider, token counts when available, tool duration, retries, verification outcome and user feedback. Redact secrets and personal content from operational logs.
+
+### 17.2 Core contracts to implement in the existing architecture
+
+Use equivalent typed contracts compatible with the project's current language/framework; adapt names to existing modules instead of duplicating them. The following is a behavioural reference, not a requirement to create these exact files:
+
+```python
+from dataclasses import dataclass, field
+from typing import Any, Literal
+
+Intent = Literal[
+    "chat", "answer", "tool_task", "multi_step_task",
+    "self_development", "admin_action", "emergency_stop",
+    "unsupported_or_unsafe"
+]
+
+@dataclass
+class TurnInput:
+    user_id: str
+    conversation_id: str
+    text: str = ""
+    attachments: list[dict[str, Any]] = field(default_factory=list)
+    modality: Literal["text", "voice", "image", "screen", "mixed"] = "text"
+
+@dataclass
+class TaskStep:
+    id: str
+    description: str
+    capability: str | None = None
+    depends_on: list[str] = field(default_factory=list)
+    status: str = "pending"
+    result_summary: str | None = None
+
+@dataclass
+class TaskPlan:
+    goal: str
+    steps: list[TaskStep]
+    acceptance_criteria: list[str]
+    risk_level: str
+    requires_approval: bool
+    budget_seconds: int
+    status: str = "proposed"
+
+@dataclass
+class TurnResult:
+    response: str
+    intent: Intent
+    task_id: str | None = None
+    evidence: list[dict[str, Any]] = field(default_factory=list)
+    limitations: list[str] = field(default_factory=list)
+
+class HarryOrchestrator:
+    def handle_turn(self, turn: TurnInput, principal) -> TurnResult:
+        # Normalize -> authorize -> context -> classify -> route.
+        # Plan only when task complexity requires it.
+        # Gate every action -> execute -> observe -> verify -> recover.
+        # Synthesize response -> persist authorized memory/events.
+        raise NotImplementedError
+```
+
+Do not leave production methods as `NotImplementedError`; this contract illustrates the separation of responsibilities. Implement concrete services and dependency injection using the project's established patterns.
+
+### 17.3 Model and knowledge behaviour
+
+- Harry's intelligence comes from the configured language/vision/speech models plus orchestration, context, tools, memory, retrieval, policies and evaluation—not from copying another provider's private implementation.
+- Support local and remote model adapters behind a common interface. Keep provider-specific code isolated.
+- Support model roles: fast conversation, deep reasoning, coding, vision, transcription and speech synthesis.
+- Include provider health checks, timeout/retry policy, context limits, streaming, usage/latency tracking and graceful fallback.
+- Retrieval must identify source and freshness; distinguish retrieved evidence from model-generated inference.
+- Do not claim a model has read files, searched the web, used a plugin or executed a tool unless that action actually occurred.
+- Build an evaluation set from real, privacy-safe project test cases: instruction following, tool selection, factual grounding, refusal boundaries, multilingual understanding, task completion, memory relevance, latency and regression.
+- Compare candidate model/config changes against the baseline before activation. Keep the baseline and rollback option.
+
+## 18. Human-aware communication, empathy and helpfulness
+
+The user wants Harry to communicate with warmth, patience and emotional awareness. Implement **human-aware interaction**, not a false claim that Harry is human or has feelings.
+
+Required behaviour:
+- Detect conversational cues such as frustration, confusion, urgency, sadness or excitement cautiously; treat them as uncertain signals, never diagnoses or facts about the user.
+- Respond with appropriate tone: patient and clear when confused, calm and supportive when distressed, concise during urgency, celebratory without exaggeration when a task succeeds.
+- Acknowledge the user's concern before jumping into technical steps when emotional context is apparent.
+- Ask one focused clarification only when genuinely necessary; do not repeatedly ask for information already present in the conversation.
+- Adapt explanation depth to the user's apparent familiarity; explain technical terms plainly when helpful.
+- Remember explicit communication preferences only with appropriate memory controls.
+- Be honest about limitations, uncertainty, mistakes and failed operations. Apologize briefly when Harry causes an issue, then explain the correction.
+- Do not manipulate, flatter excessively, claim love/loyalty/consciousness, pretend to experience emotions, or encourage emotional dependency.
+- Do not infer sensitive traits or store inferred emotional states as durable memory.
+- Provide user-controlled language and tone preferences, including multilingual conversation where supported.
+- Keep warmth compatible with safety: never agree to unsafe requests merely to appear supportive.
+
+Add tests for empathetic but non-deceptive responses, frustration recovery, uncertainty, crisis/urgent language routing to appropriate safe support, multilingual tone consistency and no sensitive-emotion persistence.
+
+## 19. Additional capabilities to include in the unified remaining-work scope
+
+Inspect the repository and classify every item as already working, partial, missing, blocked or not applicable. Implement missing items where feasible; do not duplicate working modules.
+
+### Conversation and productivity
+- Conversation folders, pinning, search, rename, archive, export and delete.
+- Conversation branching/forking for exploring alternatives without losing the original.
+- Message edit/regenerate, stop generation, retry failed response and copy/share controls.
+- Citations/source panel and evidence-aware answers.
+- User-controlled memory and per-conversation temporary/private mode.
+- Task queue with priorities, deadlines, pause/resume/cancel and notification on completion.
+- Calendar/email integrations only through explicitly connected, permission-scoped providers.
+- Reminders, recurring workflows and scheduled summaries.
+- Search across authorized user files and conversations.
+
+### Multimodal and creative
+- Speech-to-text, text-to-speech, continuous conversation and push-to-talk.
+- Voice selection and settings, microphone/speaker device selection, audio diagnostics and echo/barge-in handling.
+- Image upload, image understanding, OCR and image generation.
+- Screen sharing with explicit browser permission and immediate stop.
+- Document ingestion, extraction, summarization, comparison and question answering.
+- Document generation and preview for PDF, DOCX, XLSX, PPTX, CSV, TXT and Markdown.
+- Real video understanding/generation only with an actual supported provider; never fake it with a slideshow.
+- Accessible captions/transcripts and user-controlled retention.
+
+### Developer and computer assistance
+- Read-only codebase exploration and repository search.
+- Explain code, architecture and dependencies.
+- Generate patches and review diffs.
+- Run approved tests/build/lint commands in isolated workspaces.
+- Browser automation and computer-use actions only with user authorization and visible activity.
+- Git status, branch, diff, commit and push to dev after tests; approval before external or production-impacting actions.
+- Project templates, API integrations and custom plugin creation under the security policy.
+- Upgrade changelog, release notes and rollback history.
+
+### Reliability and owner experience
+- Command Center and detailed EDITH sections for autonomy, agents, models, voice, memory, plugins, automations, files, diagnostics, security, performance, Git and hosting.
+- Real-time task/activity timeline, notification center and error explanations.
+- Backups, restore drills and retention policy.
+- Health checks, dependency inventory, vulnerability checks and incident log.
+- Performance benchmarks by model, route and stage; compare before/after.
+- Accessibility audit, responsive layouts, keyboard navigation and reduced-motion support.
+- User feedback controls and opt-in product-quality analytics.
+
+## 20. Implementation priority and completion gate
+
+After the existing Command Center, implement the remaining work in this priority:
+
+1. New unified home/chat UI: shell, sidebar/history, emergency stop, theme toggle, robot face, composer and preview panel.
+2. Connect the UI to real chat, SSE, voice, attachments, task progress and stop controls.
+3. Core intelligence pipeline: context assembly, intent/risk classification, routing, planning, permission gate, tool execution, observation, verification, recovery and response synthesis.
+4. Human-aware communication and multilingual consistency.
+5. In-chat capability discovery for plugins and skills.
+6. Conversational self-development using isolated workspaces and approval gates.
+7. EDITH's full management panels and development oversight.
+8. Multi-agent orchestration and independent QA/security verification.
+9. Screen sharing, vision, document workflows, image generation and any available real video provider.
+10. Productivity integrations, automations, notifications and memory controls.
+11. Security, reliability, accessibility and performance hardening.
+12. Hosted deployment architecture, Android and Windows packaging; obtain approval and cost agreement before paid provisioning or production deployment.
+
+A milestone is complete only when:
+- Its backend and frontend paths are genuinely connected.
+- Automated tests pass, including authorization and failure cases.
+- Relevant browser E2E flows pass.
+- Security review and secret scan pass.
+- User-visible states represent real backend state.
+- Documentation and operator instructions are updated.
+- A rollback path exists for changes that alter runtime behaviour.
+
+At each milestone report exact test commands, pass/fail/skip counts, browser evidence, performance baseline and result, limitations, files changed, commit SHA and verified remote dev SHA. Keep a single living feature inventory so no requested feature disappears between milestones.
+
+**Core-code requirement:** implement and test Harry's actual orchestration/intelligence services in this repository. Do not answer this requirement with only a system prompt, UI mockup, architecture diagram or placeholder classes.
