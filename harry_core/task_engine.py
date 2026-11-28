@@ -53,7 +53,7 @@ _FOLLOWUP = re.compile(
 
 class Task:
     def __init__(self, title, description="", task_id=None, request_id=None,
-                 understanding=None):
+                 understanding=None, plan=None):
         # The millisecond stamp plus a uuid suffix guarantees unique ids even
         # when two tasks are created inside the same millisecond.
         self.id = task_id or f"task_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
@@ -63,6 +63,9 @@ class Task:
         # What the Core Brain understood about this request (intent, human
         # signals, entities). Used for prompt guidance and the decision record.
         self.understanding = understanding or {}
+        # Plan contract: acceptance criteria, risk level, requires_approval and
+        # the time budget this task may consume.
+        self.plan = plan or {}
         self.status = NEW
         self.kind = "question"            # question | task (decided in UNDERSTANDING)
         self.goal = ""                    # short restatement (display only)
@@ -120,7 +123,7 @@ class TaskEngine:
     # -- CRUD --------------------------------------------------------------
 
     def create_task(self, title, description="", request_id=None,
-                    understanding=None):
+                    understanding=None, plan=None):
         """Create a task. A repeated ``request_id`` returns the first task.
 
         The request id comes from the client, so a resubmitted request (double
@@ -134,7 +137,7 @@ class TaskEngine:
                                  existing.id, request_id)
                         return existing.to_dict()
             task = Task(title, description, request_id=request_id,
-                        understanding=understanding)
+                        understanding=understanding, plan=plan)
             self.tasks[task.id] = task
             self._save()
         events.emit("task_created", {"id": task.id, "title": title})
@@ -397,8 +400,23 @@ Memory context: {self._memory_context(task.title)}"""
 
     def _execute_steps(self, task):
         registry = get_registry()
+        started = time.time()
+        try:
+            budget = float((task.plan or {}).get("budget_seconds"))
+        except (TypeError, ValueError):
+            budget = None      # no budget recorded -> no artificial limit
         for step in task.steps:
             events.check_stop()
+            # >= so a zero budget is a real limit instead of a coin flip on the
+            # platform clock's resolution.
+            if budget is not None and time.time() - started >= budget:
+                task.error = (f"time budget of {budget:g}s exceeded before "
+                              f"'{str(step.get('description'))[:60]}'")
+                events.emit("task_error", {"id": task.id,
+                                           "error": task.error,
+                                           "step": step.get("description")})
+                self.update_status(task, FAILED)
+                return
             if step["status"] == "done":
                 continue                      # never redo succeeded work
             step["status"] = "running"
@@ -511,10 +529,13 @@ Memory: {self._memory_context(task.title + ' ' + step['description'])}"""
 
         summary = [{"step": s["description"], "status": s["status"],
                     "result": str(s.get("result"))[:400]} for s in task.steps]
+        criteria = "".join(
+            f"- {c}\n" for c in ((task.plan or {}).get("acceptance_criteria") or []))
         prompt = (
             "You are verifying whether an autonomous agent accomplished a goal.\n"
             f"GOAL: {task.title}\n"
-            "STEP RESULTS: " + json.dumps(summary, ensure_ascii=False)[:2000] + "\n\n"
+            + (f"ACCEPTANCE CRITERIA:\n{criteria}" if criteria else "")
+            + "STEP RESULTS: " + json.dumps(summary, ensure_ascii=False)[:2000] + "\n\n"
             "Rules:\n"
             "- If every step shows a successful (ok) result covering the goal, "
             "respond verified=true.\n"
@@ -628,8 +649,29 @@ Respond JSON: {{"analysis": "...", "strategy": "retry" | "alternative",
             task.title, config.CONFIG.get("language", {}).get("preference", "auto")
         )
         with timing.stage("memory"):
-            memory_hits = self._memory_context(task.title)
-            convo = get_memory().conversation.recent(8)
+            # The Core Brain assembles ranked, budgeted context. The older inline
+            # gathering stays as a fallback so this can never break an answer.
+            context = None
+            try:
+                from . import intelligence
+                context = intelligence.assemble_context(task.title,
+                                                        task.understanding)
+            except Exception as e:
+                log.debug("context assembly unavailable: %s", e)
+            if context is not None:
+                memory_hits = "; ".join(context["memories"]) or "none"
+                pairs = list(context["turns"])
+            else:
+                memory_hits = self._memory_context(task.title)
+                convo = get_memory().conversation.recent(8)
+                pairs = []
+                if _FOLLOWUP.match(task.title):
+                    for index in range(len(convo) - 1):
+                        turn, reply = convo[index], convo[index + 1]
+                        if (turn.get("role") == "user"
+                                and reply.get("role") == "assistant"):
+                            pairs.append((turn["text"][:200],
+                                          reply["text"][:200]))
         messages = [{
             "role": "system",
             # The specialist's own prompt only: the coordination note applies to
@@ -657,15 +699,9 @@ Respond JSON: {{"analysis": "...", "strategy": "retry" | "alternative",
         # Conversation context is only useful for genuine follow-ups. For a
         # standalone question it added prompt tokens (slow on CPU) and pulled
         # the answer towards the style/language of older replies.
-        if _FOLLOWUP.match(task.title):
-            pairs = []
-            for i in range(len(convo) - 1):
-                turn, reply = convo[i], convo[i + 1]
-                if turn.get("role") == "user" and reply.get("role") == "assistant":
-                    pairs.append((turn["text"][:200], reply["text"][:200]))
-            for user_text, reply_text in pairs[-2:]:
-                messages.append({"role": "user", "content": user_text})
-                messages.append({"role": "assistant", "content": reply_text})
+        for user_text, reply_text in pairs[-2:]:
+            messages.append({"role": "user", "content": user_text})
+            messages.append({"role": "assistant", "content": reply_text})
         messages.append({"role": "user", "content": task.title})
 
         parts = []

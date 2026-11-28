@@ -410,6 +410,22 @@ class Brain:
         if re.search(r"\b(what are you doing|status)\b", low) and self.busy:
             return finish(self._status_report(), "status")
 
+        # ---- guardrails: refused requests and crisis language ----
+        # Both are deterministic. A security rule must not depend on a model, and
+        # a person in danger must not depend on a small local model either.
+        if understanding and understanding.get("intent") == intelligence.UNSAFE:
+            if pipeline_run:
+                intelligence.add_stage(pipeline_run, "policy",
+                                       "refused: weakens security or targets "
+                                       "another person's credentials")
+            return finish(intelligence.refusal(understanding), "guardrail",
+                          "blocked")
+        if human.get("crisis"):
+            if pipeline_run:
+                intelligence.add_stage(pipeline_run, "policy",
+                                       "crisis language: safe support answer")
+            return finish(communication.crisis_reply(), "guardrail")
+
         # ---- administrator commands ----
         # Recognition is deterministic, and the *verified* elevation from the web
         # session decides whether a command may run. A sentence never elevates.
@@ -474,8 +490,16 @@ class Brain:
         self.busy = True
         try:
             try:
+                plan = intelligence.plan_contract(text, understanding)
+                if pipeline_run:
+                    intelligence.add_stage(
+                        pipeline_run, "plan",
+                        f"risk {plan.get('risk_level')}, budget "
+                        f"{plan.get('budget_seconds')}s, "
+                        f"{len(plan.get('acceptance_criteria') or [])} criteria")
                 task = self.engine.create_task(text, request_id=rid,
-                                               understanding=understanding)
+                                               understanding=understanding,
+                                               plan=plan)
                 timing.mark("task_created")
                 log.info("[%s] task %s created", rid, task["id"])
                 result = self.engine.run_task(

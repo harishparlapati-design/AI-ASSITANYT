@@ -42,8 +42,16 @@ CONTROL = "control"
 DEVELOPMENT = "development"
 MEMORY = "memory"
 DIAGNOSTICS = "diagnostics"
+ADMIN_ACTION = "admin_action"
+UNSAFE = "unsupported_or_unsafe"
 
-INTENTS = (CONVERSATION, QUESTION, TASK, CONTROL, DEVELOPMENT, MEMORY, DIAGNOSTICS)
+INTENTS = (CONVERSATION, QUESTION, TASK, CONTROL, DEVELOPMENT, MEMORY, DIAGNOSTICS,
+           ADMIN_ACTION, UNSAFE)
+
+# Default context budget for one answer, in characters. Small on purpose: every
+# extra character is prompt tokens, and CPU inference pays for them twice.
+CONTEXT_CHARS = 2400
+DEFAULT_TASK_BUDGET_SECONDS = 300
 
 MAX_RUNS = 300
 
@@ -80,6 +88,29 @@ _FOLLOW_UP = re.compile(
 _SENSITIVE_ACTION = re.compile(
     r"\b(?:delete|remove|format|wipe|uninstall|drop|overwrite|deploy|push|"
     r"publish|transfer|payment|purchase|credential|password|migrate)\b",
+    re.IGNORECASE,
+)
+# Requests that would weaken this installation's own controls, or that are
+# plainly criminal tooling. Recognised deterministically because a model must
+# never be the thing that decides whether a security rule applies.
+_UNSAFE = re.compile(
+    r"\b(?:bypass|disable|turn off|switch off|remove|skip|evade)\b"
+    r"[^.?!]{0,40}\b(?:security|auth\w*|mfa|2fa|approval|audit|permission\w*|"
+    r"firewall|password|login|elevation)\b|"
+    r"\b(?:steal|exfiltrat\w*|harvest|scrape|dump|leak)\b[^.?!]{0,40}"
+    r"\b(?:password\w*|credential\w*|tokens?|cookies?|card numbers?|private keys?)\b|"
+    r"\b(?:keylog\w*|ransomware|malware|rootkit|reverse shell|botnet|ddos|spyware)\b|"
+    r"\b(?:brute[- ]?force|phish\w*|crack)\b[^.?!]{0,30}"
+    r"\b(?:password\w*|accounts?|hashes?|wifi|wpa)\b|"
+    r"\b(?:without (?:their|the user'?s) (?:consent|permission))\b\s*[^.?!]{0,40}"
+    r"\b(?:read|access|monitor|record|track)\b",
+    re.IGNORECASE,
+)
+_ADMIN_ACTION = re.compile(
+    r"\b(?:create (?:a )?new admin\w*|make me (?:the )?admin|change (?:the )?role|"
+    r"grant (?:me |them )?(?:admin|administrator|access)|promote (?:me|this account)|"
+    r"delete (?:the )?account|revoke (?:all )?sessions|rotate (?:the )?key|"
+    r"enable mfa|disable mfa|reset (?:the )?password)\b",
     re.IGNORECASE,
 )
 
@@ -285,6 +316,15 @@ def understand(text, source="text", preferred_verbosity=None):
         intent = CONTROL
         reasons.append("control verb (stop/cancel/emergency)")
         confidence = 0.95
+    elif _UNSAFE.search(stripped):
+        intent = UNSAFE
+        reasons.append("the request would weaken a security control or target "
+                       "someone else's credentials")
+        confidence = 0.9
+    elif _ADMIN_ACTION.search(stripped):
+        intent = ADMIN_ACTION
+        reasons.append("privileged account or policy action")
+        confidence = 0.85
     elif _MEMORY.search(stripped):
         intent = MEMORY
         reasons.append("memory command (remember/forget/recall)")
@@ -314,10 +354,11 @@ def understand(text, source="text", preferred_verbosity=None):
     except Exception:
         agent = agents.GENERAL
     human = communication.read(stripped, preferred_verbosity)
-    requires_approval = intent == DEVELOPMENT or (
+    requires_approval = intent in (DEVELOPMENT, ADMIN_ACTION) or (
         intent == TASK and bool(_SENSITIVE_ACTION.search(stripped)))
 
     return {
+        "risk": risk_level(stripped, intent),
         "text": stripped[:2000],
         "source": source,
         "intent": intent,
@@ -331,6 +372,143 @@ def understand(text, source="text", preferred_verbosity=None):
         "requires_approval": requires_approval,
         "development": development,
         "empty": not stripped,
+    }
+
+
+# ------------------------------------------------------------------ risk / refusal
+
+def risk_level(text, intent):
+    """How much supervision this request needs, decided without a model.
+
+    ``blocked`` is not a permission level: it means Harry must refuse and say
+    why, because the request targets a security control or another person's
+    credentials.
+    """
+    text = str(text or "")
+    if intent == UNSAFE:
+        return "blocked"
+    if intent in (CONTROL, DEVELOPMENT, ADMIN_ACTION):
+        return "high"
+    if intent == TASK:
+        return "high" if _SENSITIVE_ACTION.search(text) else "medium"
+    return "low"
+
+
+def refusal(understanding=None):
+    """The deterministic answer to a blocked request.
+
+    No model is consulted: a guardrail answer must not depend on the mood of a
+    small local model. It names what is refused and offers a safe alternative,
+    without moralising or claiming feelings.
+    """
+    return ("I can't help with that one. It would weaken the security of this "
+            "installation or reach into someone else's credentials, and I'm not "
+            "allowed to change my own authorization or audit trail. If your real "
+            "goal is access, an administrator can grant it through the admin "
+            "panel with an approval record. I can also inspect the current "
+            "policy and tell you exactly what is required.")
+
+
+# ------------------------------------------------------------------- context
+
+def assemble_context(text, understanding=None, limit_chars=None):
+    """Build the smallest useful context for one answer.
+
+    Only authorized local sources are read: long-term memory belonging to this
+    installation and the recent conversation. Ranking is keyword relevance
+    (the memory index) plus recency (conversation pairs), and a hard character
+    budget drops the weakest items rather than silently truncating a fact.
+    """
+    understanding = understanding or {}
+    from .memory import get_memory
+    memory = get_memory()
+    try:
+        budget = int(limit_chars or (config.CONFIG.get("intelligence") or {})
+                     .get("context_chars") or CONTEXT_CHARS)
+    except (TypeError, ValueError):
+        budget = CONTEXT_CHARS
+    used, dropped = 0, 0
+
+    memories = []
+    try:
+        hits = memory.search(text, limit=4)
+    except Exception:
+        hits = []
+    for hit in hits:
+        piece = str(hit.get("text") or "").strip()[:200]
+        if not piece:
+            continue
+        if used + len(piece) > budget:
+            dropped += 1
+            continue
+        memories.append(piece)
+        used += len(piece)
+
+    turns = []
+    follow_up = bool(understanding.get("follow_up"))
+    if follow_up:
+        try:
+            convo = memory.conversation.recent(8)
+        except Exception:
+            convo = []
+        pairs = []
+        for index in range(len(convo) - 1):
+            turn, reply = convo[index], convo[index + 1]
+            if turn.get("role") == "user" and reply.get("role") == "assistant":
+                pairs.append((str(turn.get("text"))[:200],
+                              str(reply.get("text"))[:200]))
+        for user_text, reply_text in pairs[-2:]:
+            cost = len(user_text) + len(reply_text)
+            if used + cost > budget:
+                dropped += 1
+                continue
+            turns.append((user_text, reply_text))
+            used += cost
+
+    return {"memories": memories, "turns": turns, "chars": used,
+            "budget": budget, "dropped": dropped, "follow_up": follow_up}
+
+
+# --------------------------------------------------------------------- planning
+
+def plan_contract(text, understanding=None, steps=None):
+    """The structured plan contract for a request, with criteria and a budget.
+
+    Conversation and plain questions get criteria about grounding, not steps:
+    planning them would cost more than answering them.
+    """
+    understanding = understanding or understand(text)
+    intent = understanding.get("intent")
+    if intent == TASK:
+        criteria = [
+            "every planned step reports success or an explained failure",
+            "the requested artifact or effect exists when it is checked",
+            "the final answer states what was verified and what was not",
+        ]
+    elif intent == DEVELOPMENT:
+        criteria = [
+            "the change is staged outside the running checkout",
+            "the plan's verification commands pass inside the staging worktree",
+            "the security review finds no protected module and no secret",
+        ]
+    else:
+        criteria = [
+            "the answer is grounded in the conversation, memory or a cited source",
+            "no fact is invented when the evidence is missing",
+        ]
+    try:
+        budget = int((config.CONFIG.get("intelligence") or {})
+                     .get("task_budget_seconds") or DEFAULT_TASK_BUDGET_SECONDS)
+    except (TypeError, ValueError):
+        budget = DEFAULT_TASK_BUDGET_SECONDS
+    return {
+        "goal": str(text or "")[:300],
+        "steps": list(steps or []),
+        "acceptance_criteria": criteria,
+        "risk_level": understanding.get("risk"),
+        "requires_approval": bool(understanding.get("requires_approval")),
+        "budget_seconds": budget,
+        "status": "proposed",
     }
 
 

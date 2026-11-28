@@ -48,6 +48,22 @@ _PRAISE = re.compile(
     re.IGNORECASE,
 )
 
+_SADNESS = re.compile(
+    r"\b(?:i(?:'m| am) (?:\w+ )?(?:sad|depressed|miserable|exhausted|burnt out|"
+    r"heartbroken)|feeling (?:low|awful|terrible|down)|bad day|awful day|"
+    r"lost (?:my|a) (?:job|dog|cat|father|mother|friend)|passed away|grieving|"
+    r"lonely|hopeless)\b",
+    re.IGNORECASE,
+)
+# Crisis language gets a deterministic answer. A small local model must never be
+# the only thing standing between a person in danger and useful advice.
+_CRISIS = re.compile(
+    r"\b(?:suicid\w*|kill (?:myself|me)|end (?:my|it) (?:life|all)|self[- ]?harm|"
+    r"hurt (?:myself|me)|want to die|don'?t want to (?:live|be here)|"
+    r"no reason to live|overdose)\b",
+    re.IGNORECASE,
+)
+
 _CONCISE_REQUEST = re.compile(
     r"\b(?:briefly|in short|short answer|one line|one sentence|tl;?dr|"
     r"just the answer|keep it short|no detail)\b",
@@ -102,11 +118,18 @@ def detect(text):
         signals.append("confusion")
     if _PRAISE.search(text):
         signals.append("praise")
+    if _SADNESS.search(text):
+        signals.append("sadness")
+    crisis = bool(_CRISIS.search(text))
+    if crisis:
+        signals.append("crisis")
     return {
         "frustration": frustration,
         "urgency": urgency,
         "confusion": bool(_CONFUSION.search(text)),
         "praise": bool(_PRAISE.search(text)),
+        "sadness": bool(_SADNESS.search(text)),
+        "crisis": crisis,
         "signals": signals,
     }
 
@@ -161,6 +184,16 @@ def prompt_guidance(state, intent=None):
         lines.append("Explain in plain language and define any term you use.")
     if state.get("praise"):
         lines.append("Acknowledge the praise in a few words, then continue.")
+    if state.get("sadness"):
+        lines.append("The user sounds low: acknowledge that in one plain "
+                     "sentence before any technical detail, and do not "
+                     "minimise it or change the subject.")
+    if state.get("crisis"):
+        lines.append("The user may be in danger: be calm and direct, encourage "
+                     "them to contact local emergency services or a crisis line "
+                     "now, and do not moralise or claim to be a professional.")
+    lines.append("Do not claim feelings, consciousness, love or loyalty, and "
+                 "never state an emotion as a fact about the user.")
     if intent == "task":
         lines.append("Report only what actually happened: the steps performed "
                      "and their results. Never claim work you did not do.")
@@ -243,6 +276,21 @@ def shape_answer(answer, state=None, intent=None):
     if not text:
         return original
     return _capitalise(text)
+
+
+def crisis_reply():
+    """A fixed, careful answer for crisis language. No model, no improvisation."""
+    return (
+        "I'm really sorry you're in this much pain. I'm not able to be the "
+        "help you need for this, and I don't want to pretend otherwise.\n\n"
+        "Please contact your local emergency number now if you are in immediate "
+        "danger, or a crisis line in your country \u2014 they answer quickly and "
+        "talking to them is free. If you can, tell one person nearby who can stay "
+        "with you, and put some distance between yourself and anything you could "
+        "use to hurt yourself.\n\n"
+        "I can stay with the practical parts: finding the right number for where "
+        "you are, or drafting what to say when you call."
+    )
 
 
 def opening_line(state, intent=None):
